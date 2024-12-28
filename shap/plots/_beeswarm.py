@@ -29,19 +29,19 @@ from ._utils import (
 
 # TODO: Add support for hclustering based explanations where we sort the leaf order by magnitude and then show the dendrogram to the left
 def beeswarm(
-    shap_values: Explanation,
-    max_display: int | None = 10,
+    shap_values: Explanation, # SHAP値と関連情報をもつExplanationオブジェクト
+    max_display: int | None = 10, # 表示する特徴量
     order=Explanation.abs.mean(0),  # type: ignore
-    clustering=None,
-    cluster_threshold=0.5,
-    color=None,
-    axis_color="#333333",
-    alpha: float = 1.0,
-    ax: pl.Axes | None = None,
-    show: bool = True,
-    log_scale: bool = False,
-    color_bar: bool = True,
-    s: float = 16,
+    clustering=None, 
+    cluster_threshold=0.5, # クラスタリングの閾値
+    color=None, # プロットのカラーマップ or 単一色
+    axis_color="#333333", # 軸の色
+    alpha: float = 1.0, # 透明度
+    ax: pl.Axes | None = None, # 描画するAxes
+    show: bool = True, # 描画するかどうか
+    log_scale: bool = False, # 対数スケール
+    color_bar: bool = True, # カラーバー
+    s: float = 16, # マーカーサイズ
     plot_size: Literal["auto"] | float | tuple[float, float] | None = "auto",
     color_bar_label: str = labels["FEATURE_VALUE"],
     group_remaining_features: bool = True,
@@ -97,6 +97,8 @@ def beeswarm(
     See `beeswarm plot examples <https://shap.readthedocs.io/en/latest/example_notebooks/api_examples/plots/beeswarm.html>`_.
 
     """
+    
+    # --- 1) 引数が Explanation型かどうか確認 ---
     if not isinstance(shap_values, Explanation):
         emsg = "The beeswarm plot requires an `Explanation` object as the `shap_values` argument."
         raise TypeError(emsg)
@@ -114,7 +116,6 @@ def beeswarm(
             "than one dimension!"
         )
         raise ValueError(emsg)
-
     if ax and plot_size:
         emsg = (
             "The beeswarm plot does not support passing an axis and adjusting the plot size. "
@@ -123,15 +124,17 @@ def beeswarm(
         raise ValueError(emsg)
 
     shap_exp = shap_values
-    # we make a copy here, because later there are places that might modify this array
+    
+    # --- 2) SHAP値と元データを取得 ---
     values = np.copy(shap_exp.values)
     features = shap_exp.data
+    feature_names = shap_exp.feature_names
+    
+    # --- 3) データが疎行列の場合は密行列へ変換 ---
     if scipy.sparse.issparse(features):
         features = features.toarray()
-    feature_names = shap_exp.feature_names
     # if out_names is None: # TODO: waiting for slicer support
     #     out_names = shap_exp.output_names
-
     order = convert_ordering(order, values)
 
     # multi_class = False
@@ -145,65 +148,100 @@ def beeswarm(
     #         plot_type = "dot" # default for single output explanations
     #     assert len(values.shape) != 1, "Summary plots need a matrix of values, not a vector."
 
-    # default color:
+    # color の指定がない場合は、features（特徴量データ）の有無によってデフォルトのカラーマップを選択
     if color is None:
+        # 特徴量データがあるなら赤青グラデーションを、
         if features is not None:
             color = colors.red_blue
         else:
+            # 特徴量データがない場合は、単色(青系)を採用
             color = colors.blue_rgb
+
+    # color が文字列やタプルなどの場合、それを matplotlib で扱える形式に変換
     color = convert_color(color)
 
+    # idx2cat は 「各特徴量がカテゴリ型かどうか」を格納するためのフラグ一覧 (デフォルトは None)
     idx2cat = None
-    # convert from a DataFrame or other types
+
+    # --- 特徴量データ (features) の型に応じて前処理を行う ---
+    # pandas.DataFrame の場合は、列名をそのまま feature_names に使い、さらに .values で ndarray化
     if isinstance(features, pd.DataFrame):
+        # feature_names が指定されていないなら、DataFrame のカラム名を feature_names に使う
         if feature_names is None:
             feature_names = features.columns
-        # feature index to category flag
+        
+        # カテゴリ型や object 型の列がどれかを判定し、 True/False のリストを作成
         idx2cat = features.dtypes.astype(str).isin(["object", "category"]).tolist()
+        # DataFrame を numpy配列に変換
         features = features.values
+
+    # features が単なるリストの場合（例: python の list で各列名を渡したなど）
     elif isinstance(features, list):
+        # feature_names が指定されていないなら、そのまま features を名前として使う
         if feature_names is None:
             feature_names = features
+        # この場合、特徴量の実データはないので None にしておく
         features = None
+
+    # features が 1次元の配列 (shape が (n,) のような構造) で、かつ feature_names が未指定なら
+    # その配列を "特徴量名" として解釈し、features は None にして実データは存在しない扱いにする
     elif (features is not None) and len(features.shape) == 1 and feature_names is None:
         feature_names = features
         features = None
 
+    # shap_values.values の列数（特徴量数）を取得
     num_features = values.shape[1]
 
+    # --- features が実際に存在する場合（None でない場合） ---
     if features is not None:
+        # エラーメッセージのひな型（特徴量数が合わない場合に使う）
         shape_msg = "The shape of the shap_values matrix does not match the shape of the provided data matrix."
+
+        # SHAP値の列数より features の列数が1多い場合、最後の列が「定数項(オフセット)」である可能性を指摘しつつエラーにする
         if num_features - 1 == features.shape[1]:
             shape_msg += (
                 " Perhaps the extra column in the shap_values matrix is the "
                 "constant offset? If so, just pass shap_values[:,:-1]."
             )
             raise DimensionError(shape_msg)
+        
+        # それ以外で純粋に列数が一致しないなら、DimensionError を投げる
         if num_features != features.shape[1]:
             raise DimensionError(shape_msg)
 
+    # feature_names が指定されていなければ、デフォルトとして "Feature 0", "Feature 1", ... という形で作成
     if feature_names is None:
         feature_names = np.array([labels["FEATURE"] % str(i) for i in range(num_features)])
 
+    # --- matplotlib の Axes (描画先) が未指定なら現在の Axes を取得 ---
     if ax is None:
         ax = pl.gca()
-    fig = ax.get_figure()
-    assert fig is not None  # type narrowing for mypy
 
+    # Axes が属する Figure を取得（必ずあるはずなので None の場合はエラー扱い）
+    fig = ax.get_figure()
+    assert fig is not None  # mypyなどの型ヒントのための安全策
+
+    # --- log_scale = True の場合、x軸を対数スケール("symlog")にする ---
     if log_scale:
         ax.set_xscale("symlog")
 
+    # --- clustering 引数の解釈 ---
+    # clustering が None の場合は、shap_values 内にある "clustering" 属性を探して使う (あるなら)
     if clustering is None:
         partition_tree = getattr(shap_values, "clustering", None)
+        # partition_tree が存在し、その分散がすべて 0 なら、tree構造が複数含まれているとみなし[0]だけを使う
         if partition_tree is not None and partition_tree.var(0).sum() == 0:
             partition_tree = partition_tree[0]
         else:
             partition_tree = None
     elif clustering is False:
+        # clustering=False なら、クラスタリング情報を無視して None に
         partition_tree = None
     else:
+        # それ以外(明示的にクラスタリング情報が渡された場合)は、そのまま使う
         partition_tree = clustering
 
+    # partition_tree (クラスタリング情報) が有効な場合、4列(階層クラスタリングの形式)でなければエラー
     if partition_tree is not None:
         if partition_tree.shape[1] != 4:
             emsg = (

@@ -1,6 +1,9 @@
+# 1. 主要クラスのインポート
 from ._explanation import Cohorts, Explanation
+#	Cohorts, Explanation というクラス(あるいは型)をトップレベルの shap ネームスペースに公開しています。
+# 	例: shap.Cohorts, shap.Explanation などと利用できるようになる
 
-# explainers
+# 2. その他のクラスのインポート
 from .explainers import other
 from .explainers._additive import AdditiveExplainer
 from .explainers._deep import DeepExplainer
@@ -36,7 +39,7 @@ class UnsupportedModule:
     def __getattribute__(self, item):
         raise ImportError(_no_matplotlib_warning)
 
-
+# バージョンの読み込み
 try:
     import matplotlib  # noqa: F401
 
