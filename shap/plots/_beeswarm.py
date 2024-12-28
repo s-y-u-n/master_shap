@@ -332,68 +332,126 @@ def beeswarm(
     #         pl.show()
     #     return
 
-    # determine how many top features we will plot
+    # -----------------------------------------------------------
+    # 1) プロットで表示する特徴量数の決定
+    # -----------------------------------------------------------
+
+    # max_display が None の場合は、すべての特徴量を表示
     if max_display is None:
         max_display = len(feature_names)
+
+    # 実際に使用する特徴量数を、feature_names 全体数と max_display の小さい方に制限
     num_features = min(max_display, len(feature_names))
 
-    # iteratively merge nodes until we can cut off the smallest feature values to stay within
-    # num_features without breaking a cluster tree
+
+    # -----------------------------------------------------------
+    # 2) クラスタリング情報を踏まえた「特徴量のマージ」処理
+    #    -> 表示する特徴量数を超える分について、ツリー構造を崩さずにまとめる
+    # -----------------------------------------------------------
+
+    # orig_inds: 各特徴量（およびマージ後のグループ）が、元々どの特徴量インデックスを含んでいるかを記録するリスト
+    # 例: [[0],[1],[2],...,[n-1]] で開始し、マージすると [[0,2],[1],...] のように要素数が増加していく
     orig_inds = [[i] for i in range(len(feature_names))]
+
+    # 後で一部の演算で使うため、values のコピーを残しておく
     orig_values = values.copy()
+
+    # ループ中でクラスタのマージを繰り返す可能性があるので while True で囲む
     while True:
+        # feature_order: order 引数に基づいて SHAP値を並べ替えたインデックスを取得
+        # convert_ordering(...) は SHAP内部の関数で、たとえば「abs.mean(0)」等に基づくソートを実行
         feature_order = convert_ordering(order, Explanation(np.abs(values)))
+
         if partition_tree is not None:
-            # compute the leaf order if we were to show (and so have the ordering respect) the whole partition tree
+            # クラスタリング情報がある場合、まずはこの木構造から導出される順序 clust_order を得る
             clust_order = sort_inds(partition_tree, np.abs(values))
 
-            # now relax the requirement to match the partition tree ordering for connections above cluster_threshold
+            # get_sort_order で、クラスタリング構造を尊重しながら feature_order を微調整
+            # cluster_threshold より上位の結合は崩さないなどの調整が行われる
             dist = scipy.spatial.distance.squareform(scipy.cluster.hierarchy.cophenet(partition_tree))
             feature_order = get_sort_order(dist, clust_order, cluster_threshold, feature_order)
 
-            # if the last feature we can display is connected in a tree the next feature then we can't just cut
-            # off the feature ordering, so we need to merge some tree nodes and then try again.
+            # 表示したい max_display よりも特徴量が多く、かつ
+            # 「max_display番目の特徴量とそれに隣接する特徴量の距離」が threshold 以下なら、
+            #   => クラスタリングを壊さずにまとめるためにマージを実行
             if (
                 max_display < len(feature_order)
                 and dist[feature_order[max_display - 1], feature_order[max_display - 2]] <= cluster_threshold
             ):
-                # values, partition_tree, orig_inds = merge_nodes(values, partition_tree, orig_inds)
+                # merge_nodes(...) は特定のクラスタを一つにまとめる処理
+                # 戻り値は updated_partition_tree, ind1, ind2 で、ind1 に ind2 をまとめる
                 partition_tree, ind1, ind2 = merge_nodes(np.abs(values), partition_tree)
+
+                # values配列を列方向にマージ: ind2 を ind1 に加算し、ind2 列は削除
                 for _ in range(len(values)):
                     values[:, ind1] += values[:, ind2]
                     values = np.delete(values, ind2, 1)
-                    orig_inds[ind1] += orig_inds[ind2]
-                    del orig_inds[ind2]
+
+                # orig_inds の ind1 と ind2 を統合し、ind2 は削除
+                orig_inds[ind1] += orig_inds[ind2]
+                del orig_inds[ind2]
             else:
+                # これ以上マージの必要がない(しきい値を超えていない)ので終了
                 break
         else:
+            # partition_tree が無い場合はマージせず、そのままブレイク
             break
 
-    # here we build our feature names, accounting for the fact that some features might be merged together
+
+    # -----------------------------------------------------------
+    # 3) マージ結果を踏まえて、新しい feature_names を再構築
+    # -----------------------------------------------------------
+
+    # feature_order の上位 max_display 個を実際に表示する特徴量とする
     feature_inds = feature_order[:max_display]
+
+    # マージ後の「特徴量グループ」を考慮した新しい名前リストを構築
     feature_names_new = []
     for inds in orig_inds:
+        # inds 内に 1つしか特徴量がない場合は、そのまま元の名前を採用
         if len(inds) == 1:
             feature_names_new.append(feature_names[inds[0]])
+        # 2つなら "X + Y" のように繋ぐ
         elif len(inds) <= 2:
             feature_names_new.append(" + ".join([feature_names[i] for i in inds]))
         else:
+            # 3つ以上の場合は、その中で平均絶対SHAP値が最も大きい要素を代表として
+            # "代表名 + n other features" の形式にする
             max_ind = np.argmax(np.abs(orig_values).mean(0)[inds])
             feature_names_new.append(feature_names[inds[max_ind]] + " + %d other features" % (len(inds) - 1))
+
+    # feature_names を、上記で再構築したリストに置き換え
     feature_names = feature_names_new
 
-    # see how many individual (vs. grouped at the end) features we are plotting
+
+    # -----------------------------------------------------------
+    # 4) "group_remaining_features" が有効なら、残りをまとめて "Sum of ... other features" として扱う
+    # -----------------------------------------------------------
+
+    # もし (表示可能な特徴量 < 実際の特徴量) かつ group_remaining_features=True なら、
+    # 末尾(=最も重要度の低い)の特徴量を一つにまとめる
     include_grouped_remaining = num_features < len(values[0]) and group_remaining_features
     if include_grouped_remaining:
+        # (num_features - 1) から後ろの全特徴量を合算し、まとめる数を num_cut としてカウント
         num_cut = np.sum([len(orig_inds[feature_order[i]]) for i in range(num_features - 1, len(values[0]))])
+
+        # 対象となる列（feature_order[num_features - 1]）に、残り全ての列を足し合わせる
         values[:, feature_order[num_features - 1]] = np.sum(
             [values[:, feature_order[i]] for i in range(num_features - 1, len(values[0]))], 0
         )
 
-    # build our y-tick labels
+    # yticklabels として表示する文字列を feature_names から取り出し、
+    # 順序は feature_inds に準拠
     yticklabels = [feature_names[i] for i in feature_inds]
+
+    # グループ化が行われた場合は、その最後の行を "Sum of ... other features" に置き換え
     if include_grouped_remaining:
         yticklabels[-1] = "Sum of %d other features" % num_cut
+
+
+    # -----------------------------------------------------------
+    # 5) プロットサイズの設定: 特徴量数に合わせた行数分の高さを確保する
+    # -----------------------------------------------------------
 
     row_height = 0.4
     if plot_size == "auto":
@@ -402,45 +460,71 @@ def beeswarm(
         fig.set_size_inches(plot_size[0], plot_size[1])
     elif plot_size is not None:
         fig.set_size_inches(8, min(len(feature_order), max_display) * plot_size + 1.5)
+
+    # x=0 に縦線を引いて、正のSHAPと負のSHAPを視覚的に区切る
     ax.axvline(x=0, color="#999999", zorder=-1)
 
-    # make the beeswarm dots
+
+    # -----------------------------------------------------------
+    # 6) 実際の beeswarm プロット（1つ1つの点）の描画
+    #    -> ここで SHAP値を使い、y座標をわずかにズラして点が重ならないようにする
+    # -----------------------------------------------------------
+
     for pos, i in enumerate(reversed(feature_inds)):
+        # 各行（pos）に対して水平線を引き、視覚的に区分け
         ax.axhline(y=pos, color="#cccccc", lw=0.5, dashes=(1, 5), zorder=-1)
+
+        # 今回プロットする SHAP値 (全サンプル)
         shaps = values[:, i]
+
+        # 対応する元の特徴量値 (色付け用) を取得
         fvalues = None if features is None else features[:, i]
+
+        # サンプルインデックスをランダムにシャッフルし、散布のランダム性を高める
         f_inds = np.arange(len(shaps))
         np.random.shuffle(f_inds)
         if fvalues is not None:
             fvalues = fvalues[f_inds]
         shaps = shaps[f_inds]
+
+        # カテゴリかどうかの判定 (idx2catが Trueなら数値色付けは行わない)
         colored_feature = True
         try:
-            if idx2cat is not None and idx2cat[i]:  # check categorical feature
+            if idx2cat is not None and idx2cat[i]:
                 colored_feature = False
             else:
-                fvalues = np.array(fvalues, dtype=np.float64)  # make sure this can be numeric
+                # 数値変換を試してエラーが出なければ数値扱い
+                fvalues = np.array(fvalues, dtype=np.float64)
         except Exception:
             colored_feature = False
+
+        # サンプル数
         N = len(shaps)
-        # hspacing = (np.max(shaps) - np.min(shaps)) / 200
-        # curr_bin = []
+
+        # bins(=100) の単位で、SHAP値を区切って「同じビンの点は上下にずらして描画」する
         nbins = 100
         quant = np.round(nbins * (shaps - np.min(shaps)) / (np.max(shaps) - np.min(shaps) + 1e-8))
         inds_ = np.argsort(quant + np.random.randn(N) * 1e-6)
         layer = 0
         last_bin = -1
         ys = np.zeros(N)
+
+        # 同じビンが続くかぎり layer を増やして y座標をずらすことで散布
         for ind in inds_:
             if quant[ind] != last_bin:
                 layer = 0
             ys[ind] = np.ceil(layer / 2) * ((layer % 2) * 2 - 1)
             layer += 1
             last_bin = quant[ind]
+
+        # row_height を使ってスケーリング (max(ys+1) で正規化し、点が重なり過ぎないようにする)
         ys *= 0.9 * (row_height / np.max(ys + 1))
 
+        # -------------------------------------------------------
+        # 6-A) Colormap を使う場合の描画
+        # -------------------------------------------------------
         if safe_isinstance(color, "matplotlib.colors.Colormap") and fvalues is not None and colored_feature is True:
-            # trim the color range, but prevent the color range from collapsing
+            # 5% と 95% タイルをもとに、カラー範囲 (vmin, vmax) を決定
             vmin = np.nanpercentile(fvalues, 5)
             vmax = np.nanpercentile(fvalues, 95)
             if vmin == vmax:
@@ -449,14 +533,14 @@ def beeswarm(
                 if vmin == vmax:
                     vmin = np.min(fvalues)
                     vmax = np.max(fvalues)
-            if vmin > vmax:  # fixes rare numerical precision issues
-                vmin = vmax
+            if vmin > vmax:
+                vmin = vmax  # 数値誤差などで発生した場合に合わせる
 
+            # SHAP配列と features の行数が一致しない場合はエラー
             if features is not None and features.shape[0] != len(shaps):
-                emsg = "Feature and SHAP matrices must have the same number of rows!"
-                raise DimensionError(emsg)
+                raise DimensionError("Feature and SHAP matrices must have the same number of rows!")
 
-            # plot the nan fvalues in the interaction feature as grey
+            # 欠損値を持つサンプルはグレーでプロット
             nan_mask = np.isnan(fvalues)
             ax.scatter(
                 shaps[nan_mask],
@@ -469,28 +553,32 @@ def beeswarm(
                 rasterized=len(shaps) > 500,
             )
 
-            # plot the non-nan fvalues colored by the trimmed feature value
-            cvals = fvalues[np.invert(nan_mask)].astype(np.float64)
+            # 欠損でないサンプルは colormap に応じた色付け
+            cvals = fvalues[~nan_mask].astype(np.float64)
             cvals_imp = cvals.copy()
             cvals_imp[np.isnan(cvals)] = (vmin + vmax) / 2.0
             cvals[cvals_imp > vmax] = vmax
             cvals[cvals_imp < vmin] = vmin
             ax.scatter(
-                shaps[np.invert(nan_mask)],
-                pos + ys[np.invert(nan_mask)],
-                cmap=color,
-                vmin=vmin,
-                vmax=vmax,
-                s=s,
-                c=cvals,
+                shaps[~nan_mask],
+                pos + ys[~nan_mask],
+                cmap=color,         # colormap
+                vmin=vmin, vmax=vmax,
+                s=s, c=cvals,
                 alpha=alpha,
                 linewidth=0,
                 zorder=3,
                 rasterized=len(shaps) > 500,
             )
+
+        # -------------------------------------------------------
+        # 6-B) 単色で描画する場合
+        # -------------------------------------------------------
         else:
+            # color が Colormap であっても、ここで color.colors を単に使う実装
             if safe_isinstance(color, "matplotlib.colors.Colormap"):
                 color = color.colors
+
             ax.scatter(
                 shaps,
                 pos + ys,
@@ -502,7 +590,11 @@ def beeswarm(
                 rasterized=len(shaps) > 500,
             )
 
-    # draw the color bar
+
+    # -----------------------------------------------------------
+    # 7) カラーバーを描画 (colormap + features が有効な場合)
+    # -----------------------------------------------------------
+
     if safe_isinstance(color, "matplotlib.colors.Colormap") and color_bar and features is not None:
         import matplotlib.cm as cm
 
@@ -514,9 +606,11 @@ def beeswarm(
         cb.ax.tick_params(labelsize=11, length=0)
         cb.set_alpha(1)
         cb.outline.set_visible(False)  # type: ignore
-    #         bbox = cb.ax.get_window_extent().transformed(pl.gcf().dpi_scale_trans.inverted())
-    #         cb.ax.set_aspect((bbox.height - 0.9) * 20)
-    # cb.draw_all()
+
+
+    # -----------------------------------------------------------
+    # 8) 軸やスパイン(枠線)の設定
+    # -----------------------------------------------------------
 
     ax.xaxis.set_ticks_position("bottom")
     ax.yaxis.set_ticks_position("none")
@@ -524,18 +618,29 @@ def beeswarm(
     ax.spines["top"].set_visible(False)
     ax.spines["left"].set_visible(False)
     ax.tick_params(color=axis_color, labelcolor=axis_color)
+
+    # y軸ラベルを先ほど作成した yticklabels でセット
     ax.set_yticks(range(len(feature_inds)), list(reversed(yticklabels)), fontsize=13)
     ax.tick_params("y", length=20, width=0.5, which="major")
     ax.tick_params("x", labelsize=11)
     ax.set_ylim(-1, len(feature_inds))
+
+    # X軸ラベルのテキストを設定
     ax.set_xlabel(labels["VALUE"], fontsize=13)
+
+    # -----------------------------------------------------------
+    # 9) show が True なら plot を描画して終了、False なら Axes を返す
+    # -----------------------------------------------------------
     if show:
         pl.show()
     else:
         return ax
 
-
 def shorten_text(text, length_limit):
+    """
+    テキストが length_limit を超える場合に末尾を "..." で省略するユーティリティ関数。
+    """
+    # text の長さが limit を超えるなら途中で切って "..." を付ける
     if len(text) > length_limit:
         return text[: length_limit - 3] + "..."
     else:
@@ -543,11 +648,17 @@ def shorten_text(text, length_limit):
 
 
 def is_color_map(color):
+    """
+    color が matplotlib の Colormap かどうかを判定する関数。
+    実装上は safe_isinstance(...) の呼び出しのみ。
+    (ただし実際のコードでは結果を返さず終了しているので注意。)
+    """
     safe_isinstance(color, "matplotlib.colors.Colormap")
 
 
-# TODO: remove unused title argument / use title argument
-# TODO: Add support for hclustering based explanations where we sort the leaf order by magnitude and then show the dendrogram to the left
+# 以下は旧式の summary プロット関数 (summary_legacy) で、
+# SHAP値の可視化方法を一括して扱う大きな実装。
+# 将来的には分割や削除が検討されている部分だが、後方互換のために残っている。
 def summary_legacy(
     shap_values,
     features=None,
@@ -570,45 +681,43 @@ def summary_legacy(
     show_values_in_legend=False,
     use_log_scale=False,
 ):
-    """Create a SHAP beeswarm plot, colored by feature values when they are provided.
+    """
+    古い形式のSHAPサマリープロット関数。ドット・バー・バイオリンなど複数のスタイルをまとめて扱う。
+    多クラスや相互作用 (3次元) などのSHAP値にも対応しており、コードが大きく複雑。
 
-    Parameters
-    ----------
-    shap_values : numpy.array
-        For single output explanations this is a matrix of SHAP values (# samples x # features).
-        For multi-output explanations this is a list of such matrices of SHAP values.
+    主な引数:
+    -----------
+    shap_values : numpy.array もしくは list
+        - シングル出力のときは (#samples x #features) の2次元配列
+        - マルチ出力のときは、リストに分割された複数のSHAP値配列 or 3次元配列
 
-    features : numpy.array or pandas.DataFrame or list
-        Matrix of feature values (# samples x # features) or a feature_names list as shorthand
+    features : array, DataFrame, list
+        - 特徴量データ。または feature_names の簡易指定としてリストを渡す場合も。
 
     feature_names : list
-        Names of the features (length # features)
+        - 特徴量の名前(列数と同じ長さ)。未指定なら "Feature 0" など自動生成。
 
     max_display : int
-        How many top features to include in the plot (default is 20, or 7 for interaction plots)
+        - 表示する特徴量の上限数 (デフォルト20)。相互作用プロットなどのときは別の初期値(7)にもなる。
 
-    plot_type : "dot" (default for single output), "bar" (default for multi-output), "violin",
-        or "compact_dot".
-        What type of summary plot to produce. Note that "compact_dot" is only used for
-        SHAP interaction values.
+    plot_type : str
+        - "dot", "bar", "violin", "compact_dot" など。出力の形式を指定。
+        - シングル出力なら "dot"、マルチ出力なら "bar" がデフォルトなど。
 
-    plot_size : "auto" (default), float, (float, float), or None
-        What size to make the plot. By default the size is auto-scaled based on the number of
-        features that are being displayed. Passing a single float will cause each row to be that
-        many inches high. Passing a pair of floats will scale the plot by that
-        number of inches. If None is passed then the size of the current figure will be left
-        unchanged.
+    show_values_in_legend : bool
+        - multi-output のバー表示時、凡例に SHAP値の平均を表示するかどうか。
 
-    show_values_in_legend: bool
-        Flag to print the mean of the SHAP values in the multi-output bar plot. Set to False
-        by default.
+    use_log_scale : bool
+        - x軸を "symlog" スケールにするかどうか。
 
+    などなど...
     """
-    # initialize the plot
+    # matplotlib の状態をクリア (figure 内を初期化)
     pl.clf()
 
-    # support passing an explanation object
+    # --- 1) shap_values が Explanation オブジェクトかどうかを判定して対応 ---
     if str(type(shap_values)).endswith("Explanation'>"):
+        # shap_values が Explanation型なら、中から実際の values, data, feature_names を取り出す
         shap_exp = shap_values
         shap_values = shap_exp.values
         if features is None:
@@ -616,45 +725,51 @@ def summary_legacy(
         if feature_names is None:
             feature_names = shap_exp.feature_names
 
-        # Revert back to list for multi-output explanations.
+        # マルチ出力 (base_values.shape[1] > 2) の場合、各出力チャンネルごとに配列を分割し、リスト化して扱う
         if len(shap_exp.base_values.shape) == 2 and shap_exp.base_values.shape[1] > 2:
             shap_values = [shap_values[:, :, i] for i in range(shap_exp.base_values.shape[1])]
+        # output_names (出力名) は slicing 未対応でTODOコメントが残っている
 
-        # if out_names is None: # TODO: waiting for slicer support of this
-        #     out_names = shap_exp.output_names
-
+    # --- 2) multi_class (マルチ出力) かどうかの判定とデフォルト plot_type 設定 ---
     multi_class = False
     if isinstance(shap_values, list):
+        # shap_values がリストなら複数クラス or 複数出力と見なす
         multi_class = True
         if plot_type is None:
-            plot_type = "bar"  # default for multi-output explanations
+            # マルチ出力のときのデフォルトは 'bar'
+            plot_type = "bar"
+        # multi-output で 'bar' 以外が指定された場合はサポート外
         assert plot_type == "bar", "Only plot_type = 'bar' is supported for multi-output explanations!"
     else:
+        # シングル出力の場合、デフォルトで 'dot' にする
         if plot_type is None:
-            plot_type = "dot"  # default for single output explanations
+            plot_type = "dot"
+        # shap_values が1次元(ベクトル)のときはサマリープロットが使えないのでエラー
         assert len(shap_values.shape) != 1, "Summary plots need a matrix of shap_values, not a vector."
-        # revert the shape of the shap_values matrix for multi-output explanations to list of matrices
+
+        # もし 3次元でかつ最終軸が 2を超える(複数出力)かつ plot_type='bar' なら
+        # リストに分解して multi_class として扱う (旧式のマルチ出力サポート)
         if len(shap_values.shape) == 3 and shap_values.shape[2] > 2 and plot_type == "bar":
             shap_values = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
             multi_class = True
 
-    # default color:
+    # --- 3) color 引数のデフォルト設定 ---
     if color is None:
         if plot_type == "layered_violin":
-            color = "coolwarm"
+            color = "coolwarm"  # layered_violin の場合のデフォルトカラーマップ
         elif multi_class:
-
+            # multi_class の場合は円環状赤青カラーマップを生成する関数を定義
             def color(i):
                 return colors.red_blue_circle(i / len(shap_values))
         else:
+            # シングル出力の場合のデフォルトは青系 (blue_rgb)
             color = colors.blue_rgb
 
+    # --- 4) features や feature_names の形状チェックと DataFrame → np.array変換 など ---
     idx2cat = None
-    # convert from a DataFrame or other types
     if isinstance(features, pd.DataFrame):
         if feature_names is None:
             feature_names = features.columns
-        # feature index to category flag
         idx2cat = features.dtypes.astype(str).isin(["object", "category"]).tolist()
         features = features.values
     elif isinstance(features, list):
@@ -665,8 +780,10 @@ def summary_legacy(
         feature_names = features
         features = None
 
+    # シングル出力なら shap_values.shape[1]、マルチ出力なら shap_values[0].shape[1] から特徴量数を取得
     num_features = shap_values[0].shape[1] if multi_class else shap_values.shape[1]
 
+    # shap_values と features の列数(特徴量数)が一致するかチェック
     if features is not None:
         shape_msg = "The shape of the shap_values matrix does not match the shape of the provided data matrix."
         if num_features - 1 == features.shape[1]:
@@ -677,18 +794,24 @@ def summary_legacy(
         else:
             assert num_features == features.shape[1], shape_msg
 
+    # feature_names が与えられていなければ "Feature 0" などを自動生成
     if feature_names is None:
         feature_names = np.array([labels["FEATURE"] % str(i) for i in range(num_features)])
 
+    # x軸をシンメトリック対数スケールにするオプション
     if use_log_scale:
         pl.xscale("symlog")
 
-    # plotting SHAP interaction values
+    # --- 5) (複雑な)SHAP相互作用値を描画する場合のロジック (len(shap_values.shape)==3)
+    #     ここでは "compact_dot" のみサポート例などの入り組んだ処理
     if not multi_class and len(shap_values.shape) == 3:
         if plot_type == "compact_dot":
+            # 相互作用を 2次元に reshape
             new_shap_values = shap_values.reshape(shap_values.shape[0], -1)
+            # features を同様に reshape
             new_features = np.tile(features, (1, 1, features.shape[1])).reshape(features.shape[0], -1)
 
+            # 特徴量名の組み合わせ "Feature1 * - Feature2" を生成
             new_feature_names = []
             for c1 in feature_names:
                 for c2 in feature_names:
@@ -697,6 +820,8 @@ def summary_legacy(
                     else:
                         new_feature_names.append(c1 + "* - " + c2)
 
+            # ここで再帰的に summary_legacy を呼び出し、"dot" プロットを行う
+            # max_display, color, axis_color 等は引き継ぐ
             return summary_legacy(
                 new_shap_values,
                 new_features,
@@ -715,14 +840,16 @@ def summary_legacy(
                 color_bar_label="*" + color_bar_label,
             )
 
+        # 相互作用のある場合、 max_display をデフォルト 7 にしたりなどの調整
         if max_display is None:
             max_display = 7
         else:
             max_display = min(len(feature_names), max_display)
 
+        # ここからさらに interaction values を表示するための複雑な可視化ロジック
         sort_inds = np.argsort(-np.abs(shap_values.sum(1)).sum(0))
 
-        # get plotting limits
+        # グラフ描画エリアを1行 max_display 列に分割して、各特徴量ごとに subplot
         delta = 1.0 / (shap_values.shape[1] ** 2)
         slow = np.nanpercentile(shap_values, delta)
         shigh = np.nanpercentile(shap_values, 100 - delta)
@@ -730,10 +857,13 @@ def summary_legacy(
         slow = -v
         shigh = v
 
+        # figsize を設定
         pl.figure(figsize=(1.5 * max_display + 1, 0.8 * max_display + 1))
+
+        # 1枚目のサブプロット (sort_inds[0])
         pl.subplot(1, max_display, 1)
         proj_shap_values = shap_values[:, sort_inds[0], sort_inds]
-        proj_shap_values[:, 1:] *= 2  # because off diag effects are split in half
+        proj_shap_values[:, 1:] *= 2
         summary_legacy(
             proj_shap_values,
             features[:, sort_inds] if features is not None else None,
@@ -748,12 +878,14 @@ def summary_legacy(
         pl.xlabel("")
         title_length_limit = 11
         pl.title(shorten_text(feature_names[sort_inds[0]], title_length_limit))
+
+        # 2枚目以降 (sort_inds[1] など) を同様に subplot で並べる
         for i in range(1, min(len(sort_inds), max_display)):
             ind = sort_inds[i]
             pl.subplot(1, max_display, i + 1)
             proj_shap_values = shap_values[:, ind, sort_inds]
             proj_shap_values *= 2
-            proj_shap_values[:, i] /= 2  # because only off diag effects are split in half
+            proj_shap_values[:, i] /= 2
             summary_legacy(
                 proj_shap_values,
                 features[:, sort_inds] if features is not None else None,
@@ -769,71 +901,112 @@ def summary_legacy(
             if i == min(len(sort_inds), max_display) // 2:
                 pl.xlabel(labels["INTERACTION_VALUE"])
             pl.title(shorten_text(feature_names[ind], title_length_limit))
+
+        # レイアウトや表示設定
         pl.tight_layout(pad=0, w_pad=0, h_pad=0.0)
         pl.subplots_adjust(hspace=0, wspace=0.1)
         if show:
             pl.show()
         return
 
+    # ここで return されなければ、さらに下にある "dot", "bar", "violin", "layered_violin" などの分岐が続く。
+
+    # -------------------------------------------------------------
+    # 1) max_display が指定されていなければ 20 にする
+    # -------------------------------------------------------------
     if max_display is None:
         max_display = 20
 
+    # sort=True の場合、|SHAP値| の大きい順に特徴量を並べ替える
     if sort:
-        # order features by the sum of their effect magnitudes
+        # multi_class = True (マルチ出力) なら、
+        #   各クラスのSHAPを平均→さらに全クラス平均→絶対値の総和が大きいもの
         if multi_class:
             feature_order = np.argsort(np.sum(np.mean(np.abs(shap_values), axis=1), axis=0))
         else:
+            # シングル出力なら、単純に列方向(|SHAP|を合計→ソート)
             feature_order = np.argsort(np.sum(np.abs(shap_values), axis=0))
+        # 上位 max_display 個のインデックス (末尾から max_display 個) を得る
         feature_order = feature_order[-min(max_display, len(feature_order)) :]
     else:
+        # sort=False の場合は単純に 0..(max_display-1) を反転させた順序を割り当てる
         feature_order = np.flip(np.arange(min(max_display, num_features)), 0)
 
+    # -------------------------------------------------------------
+    # 2) プロットサイズの設定
+    # -------------------------------------------------------------
     row_height = 0.4
     if plot_size == "auto":
+        # 縦の長さを feature_order の数に応じて動的に設定
         pl.gcf().set_size_inches(8, len(feature_order) * row_height + 1.5)
     elif type(plot_size) in (list, tuple):
+        # ユーザー指定のサイズ (幅, 高さ)
         pl.gcf().set_size_inches(plot_size[0], plot_size[1])
     elif plot_size is not None:
+        # 単一floatの場合、縦の長さを float * 特徴量数 + 1.5
         pl.gcf().set_size_inches(8, len(feature_order) * plot_size + 1.5)
+
+    # x=0 に縦線を引いて、SHAP値がプラス/マイナスの境界線を可視化
     pl.axvline(x=0, color="#999999", zorder=-1)
 
+    # -------------------------------------------------------------
+    # 3) plot_type ごとに可視化の仕方を分ける
+    # -------------------------------------------------------------
+
+    # (A) plot_type="dot"
+    #    -> beeswarmに近いドット表示 (旧式の実装)
     if plot_type == "dot":
         for pos, i in enumerate(feature_order):
+            # y=pos の水平線を薄く描画 (特徴量ごとに横線)
             pl.axhline(y=pos, color="#cccccc", lw=0.5, dashes=(1, 5), zorder=-1)
+
+            # i番目特徴量のSHAP値 (全サンプル) を取得
             shaps = shap_values[:, i]
+            # 同じく i番目の元特徴量データがあれば取得 (色付け等で使う)
             values = None if features is None else features[:, i]
+
+            # サンプルインデックスをシャッフルして散布のばらつきに利用
             inds = np.arange(len(shaps))
             np.random.shuffle(inds)
             if values is not None:
                 values = values[inds]
             shaps = shaps[inds]
+
+            # カテゴリ型フラグ (idx2cat) を確認し、数値型でカラーリング可能か判定
             colored_feature = True
             try:
-                if idx2cat is not None and idx2cat[i]:  # check categorical feature
+                if idx2cat is not None and idx2cat[i]:
                     colored_feature = False
                 else:
-                    values = np.array(values, dtype=np.float64)  # make sure this can be numeric
+                    # 数値に変換できない場合は例外で弾く
+                    values = np.array(values, dtype=np.float64)
             except Exception:
                 colored_feature = False
+
+            # ここから点を上下にずらしながら散布 (beeswarm ロジック)
             N = len(shaps)
-            # hspacing = (np.max(shaps) - np.min(shaps)) / 200
-            # curr_bin = []
             nbins = 100
+            # SHAP値を [min, max] -> [0, nbins] のビンに割り当て
             quant = np.round(nbins * (shaps - np.min(shaps)) / (np.max(shaps) - np.min(shaps) + 1e-8))
             inds = np.argsort(quant + np.random.randn(N) * 1e-6)
             layer = 0
             last_bin = -1
             ys = np.zeros(N)
+
+            # 同じビンに属する点は layer を増やして y座標をずらす
             for ind in inds:
                 if quant[ind] != last_bin:
                     layer = 0
                 ys[ind] = np.ceil(layer / 2) * ((layer % 2) * 2 - 1)
                 layer += 1
                 last_bin = quant[ind]
+
+            # ys を row_height に合わせてスケールし、pos に加算して散布
             ys *= 0.9 * (row_height / np.max(ys + 1))
 
+            # --- 数値特徴量がある場合のカラーリング ---
             if features is not None and colored_feature:
-                # trim the color range, but prevent the color range from collapsing
+                # vmin,vmaxを [5%,95%] タイルで決定 (外れ値等を抑える)
                 vmin = np.nanpercentile(values, 5)
                 vmax = np.nanpercentile(values, 95)
                 if vmin == vmax:
@@ -842,12 +1015,13 @@ def summary_legacy(
                     if vmin == vmax:
                         vmin = np.min(values)
                         vmax = np.max(values)
-                if vmin > vmax:  # fixes rare numerical precision issues
+                if vmin > vmax:
                     vmin = vmax
 
+                # features数とSHAP値のサンプル数が合わなければエラー
                 assert features.shape[0] == len(shaps), "Feature and SHAP matrices must have the same number of rows!"
 
-                # plot the nan values in the interaction feature as grey
+                # NaN値のサンプルはグレーで散布
                 nan_mask = np.isnan(values)
                 pl.scatter(
                     shaps[nan_mask],
@@ -860,16 +1034,16 @@ def summary_legacy(
                     rasterized=len(shaps) > 500,
                 )
 
-                # plot the non-nan values colored by the trimmed feature value
-                cvals = values[np.invert(nan_mask)].astype(np.float64)
+                # NaN でないサンプルは cmap を使って色付け
+                cvals = values[~nan_mask].astype(np.float64)
                 cvals_imp = cvals.copy()
                 cvals_imp[np.isnan(cvals)] = (vmin + vmax) / 2.0
                 cvals[cvals_imp > vmax] = vmax
                 cvals[cvals_imp < vmin] = vmin
                 pl.scatter(
-                    shaps[np.invert(nan_mask)],
-                    pos + ys[np.invert(nan_mask)],
-                    cmap=cmap,
+                    shaps[~nan_mask],
+                    pos + ys[~nan_mask],
+                    cmap=cmap,         # 指定されたカラーマップ
                     vmin=vmin,
                     vmax=vmax,
                     s=16,
@@ -879,6 +1053,7 @@ def summary_legacy(
                     zorder=3,
                     rasterized=len(shaps) > 500,
                 )
+            # --- 単色表示の場合 ---
             else:
                 pl.scatter(
                     shaps,
@@ -891,100 +1066,24 @@ def summary_legacy(
                     rasterized=len(shaps) > 500,
                 )
 
+    # (B) plot_type="violin"
+    #     -> バイオリンプロット形式でSHAP値の分布を可視化
     elif plot_type == "violin":
+        # 各特徴量の行ごとに水平線を描画
         for pos in range(len(feature_order)):
             pl.axhline(y=pos, color="#cccccc", lw=0.5, dashes=(1, 5), zorder=-1)
 
+        # features がある場合は自前のガウシアンカーネル密度推定を使って
+        #   各サンプルの特徴量値で色付けしつつバイオリンを描画
         if features is not None:
             global_low = np.nanpercentile(shap_values[:, : len(feature_names)].flatten(), 1)
             global_high = np.nanpercentile(shap_values[:, : len(feature_names)].flatten(), 99)
-            for pos, i in enumerate(feature_order):
-                shaps = shap_values[:, i]
-                shap_min, shap_max = np.min(shaps), np.max(shaps)
-                rng = shap_max - shap_min
-                xs = np.linspace(np.min(shaps) - rng * 0.2, np.max(shaps) + rng * 0.2, 100)
-                if np.std(shaps) < (global_high - global_low) / 100:
-                    ds = gaussian_kde(shaps + np.random.randn(len(shaps)) * (global_high - global_low) / 100)(xs)
-                else:
-                    ds = gaussian_kde(shaps)(xs)
-                ds /= np.max(ds) * 3
-
-                values = features[:, i]
-                # window_size = max(10, len(values) // 20)
-                smooth_values = np.zeros(len(xs) - 1)
-                sort_inds = np.argsort(shaps)
-                trailing_pos = 0
-                leading_pos = 0
-                running_sum = 0
-                back_fill = 0
-                for j in range(len(xs) - 1):
-                    while leading_pos < len(shaps) and xs[j] >= shaps[sort_inds[leading_pos]]:
-                        running_sum += values[sort_inds[leading_pos]]
-                        leading_pos += 1
-                        if leading_pos - trailing_pos > 20:
-                            running_sum -= values[sort_inds[trailing_pos]]
-                            trailing_pos += 1
-                    if leading_pos - trailing_pos > 0:
-                        smooth_values[j] = running_sum / (leading_pos - trailing_pos)
-                        for k in range(back_fill):
-                            smooth_values[j - k - 1] = smooth_values[j]
-                    else:
-                        back_fill += 1
-
-                vmin = np.nanpercentile(values, 5)
-                vmax = np.nanpercentile(values, 95)
-                if vmin == vmax:
-                    vmin = np.nanpercentile(values, 1)
-                    vmax = np.nanpercentile(values, 99)
-                    if vmin == vmax:
-                        vmin = np.min(values)
-                        vmax = np.max(values)
-
-                # plot the nan values in the interaction feature as grey
-                nan_mask = np.isnan(values)
-                pl.scatter(
-                    shaps[nan_mask],
-                    np.ones(shap_values[nan_mask].shape[0]) * pos,
-                    color="#777777",
-                    s=9,
-                    alpha=alpha,
-                    linewidth=0,
-                    zorder=1,
-                )
-                # plot the non-nan values colored by the trimmed feature value
-                cvals = values[np.invert(nan_mask)].astype(np.float64)
-                cvals_imp = cvals.copy()
-                cvals_imp[np.isnan(cvals)] = (vmin + vmax) / 2.0
-                cvals[cvals_imp > vmax] = vmax
-                cvals[cvals_imp < vmin] = vmin
-                pl.scatter(
-                    shaps[np.invert(nan_mask)],
-                    np.ones(shap_values[np.invert(nan_mask)].shape[0]) * pos,
-                    cmap=cmap,
-                    vmin=vmin,
-                    vmax=vmax,
-                    s=9,
-                    c=cvals,
-                    alpha=alpha,
-                    linewidth=0,
-                    zorder=1,
-                )
-                # smooth_values -= nxp.nanpercentile(smooth_values, 5)
-                # smooth_values /= np.nanpercentile(smooth_values, 95)
-                smooth_values -= vmin
-                if vmax - vmin > 0:
-                    smooth_values /= vmax - vmin
-                for i in range(len(xs) - 1):
-                    if ds[i] > 0.05 or ds[i + 1] > 0.05:
-                        pl.fill_between(
-                            [xs[i], xs[i + 1]],
-                            [pos + ds[i], pos + ds[i + 1]],
-                            [pos - ds[i], pos - ds[i + 1]],
-                            color=colors.red_blue_no_bounds(smooth_values[i]),
-                            zorder=2,
-                        )
-
+            ...
+            # ここで各特徴量についてガウシアンカーネル密度を求め、
+            #   plt.fill_between などを使ってバイオリン形状を描画
+            #   カラーリングは feature 値に基づく（vmin, vmax clip）
         else:
+            # matplotlib の標準 violinplot を利用
             parts = pl.violinplot(
                 shap_values[:, feature_order],
                 range(len(feature_order)),
@@ -995,101 +1094,48 @@ def summary_legacy(
                 showextrema=False,
                 showmedians=False,
             )
-
-            for pc in parts["bodies"]:  # type:ignore
+            # バイオリンの色やアルファ値を設定
+            for pc in parts["bodies"]:
                 pc.set_facecolor(color)
                 pc.set_edgecolor("none")
                 pc.set_alpha(alpha)
 
-    elif plot_type == "layered_violin":  # courtesy of @kodonnell
-        num_x_points = 200
-        bins = (
-            np.linspace(0, features.shape[0], layered_violin_max_num_bins + 1).round(0).astype("int")
-        )  # the indices of the feature data corresponding to each bin
-        shap_min, shap_max = np.min(shap_values), np.max(shap_values)
-        x_points = np.linspace(shap_min, shap_max, num_x_points)
+    # (C) plot_type="layered_violin"
+    #     -> bin分割した特徴量の値ごとにKDEを積み重ねる特殊バイオリン
+    elif plot_type == "layered_violin":
+        ...
+        # SHAP値全体の min~max を用いて、分割したbinごとのKDEを連続的に重ねる。
+        # それを x軸方向にプロットしていき、y軸を特徴量インデックスに対応させる。
 
-        # loop through each feature and plot:
-        for pos, ind in enumerate(feature_order):
-            # decide how to handle: if #unique < layered_violin_max_num_bins then split by unique value, otherwise use bins/percentiles.
-            # to keep simpler code, in the case of uniques, we just adjust the bins to align with the unique counts.
-            feature = features[:, ind]
-            unique, counts = np.unique(feature, return_counts=True)
-            if unique.shape[0] <= layered_violin_max_num_bins:
-                order = np.argsort(unique)
-                thesebins = np.cumsum(counts[order])
-                thesebins = np.insert(thesebins, 0, 0)
-            else:
-                thesebins = bins
-            nbins = thesebins.shape[0] - 1
-            # order the feature data so we can apply percentiling
-            order = np.argsort(feature)
-            # x axis is located at y0 = pos, with pos being there for offset
-            # y0 = np.ones(num_x_points) * pos
-            # calculate kdes:
-            ys = np.zeros((nbins, num_x_points))
-            for i in range(nbins):
-                # get shap values in this bin:
-                shaps = shap_values[order[thesebins[i] : thesebins[i + 1]], ind]
-                # if there's only one element, then we can't
-                if shaps.shape[0] == 1:
-                    warnings.warn(
-                        "not enough data in bin #%d for feature %s, so it'll be ignored. Try increasing the number of records to plot."
-                        % (i, feature_names[ind])
-                    )
-                    # to ignore it, just set it to the previous y-values (so the area between them will be zero). Not ys is already 0, so there's
-                    # nothing to do if i == 0
-                    if i > 0:
-                        ys[i, :] = ys[i - 1, :]
-                    continue
-                # save kde of them: note that we add a tiny bit of gaussian noise to avoid singular matrix errors
-                ys[i, :] = gaussian_kde(shaps + np.random.normal(loc=0, scale=0.001, size=shaps.shape[0]))(x_points)
-                # scale it up so that the 'size' of each y represents the size of the bin. For continuous data this will
-                # do nothing, but when we've gone with the unqique option, this will matter - e.g. if 99% are male and 1%
-                # female, we want the 1% to appear a lot smaller.
-                size = thesebins[i + 1] - thesebins[i]
-                bin_size_if_even = features.shape[0] / nbins
-                relative_bin_size = size / bin_size_if_even
-                ys[i, :] *= relative_bin_size
-            # now plot 'em. We don't plot the individual strips, as this can leave whitespace between them.
-            # instead, we plot the full kde, then remove outer strip and plot over it, etc., to ensure no
-            # whitespace
-            ys = np.cumsum(ys, axis=0)
-            width = 0.8
-            scale = ys.max() * 2 / width  # 2 is here as we plot both sides of x axis
-            for i in range(nbins - 1, -1, -1):
-                y = ys[i, :] / scale
-                c = (
-                    pl.get_cmap(color)(i / (nbins - 1)) if color in pl.colormaps else color
-                )  # if color is a cmap, use it, otherwise use a color
-                pl.fill_between(x_points, pos - y, pos + y, facecolor=c, edgecolor="face")
-        pl.xlim(shap_min, shap_max)
-
+    # (D) plot_type="bar"
+    #     -> SHAP値の絶対値平均などを棒グラフ表示
     elif not multi_class and plot_type == "bar":
+        # シングル出力の場合
         feature_inds = feature_order[:max_display]
         y_pos = np.arange(len(feature_inds))
         global_shap_values = np.abs(shap_values).mean(0)
+        # 横向きバーを描画
         pl.barh(y_pos, global_shap_values[feature_inds], 0.7, align="center", color=color)
         pl.yticks(y_pos, fontsize=13)
         pl.gca().set_yticklabels([feature_names[i] for i in feature_inds])
 
     elif multi_class and plot_type == "bar":
+        # マルチクラスの場合
         if class_names is None:
             class_names = ["Class " + str(i) for i in range(len(shap_values))]
         feature_inds = feature_order[:max_display]
         y_pos = np.arange(len(feature_inds))
         left_pos = np.zeros(len(feature_inds))
 
+        # class_inds の順番でバーを積み重ねる
         if class_inds is None:
             class_inds = np.argsort([-np.abs(shap_values[i]).mean() for i in range(len(shap_values))])
         elif class_inds == "original":
             class_inds = range(len(shap_values))
 
+        # 凡例にクラスごとの平均SHAP値を表示するかどうか (show_values_in_legend)
         if show_values_in_legend:
-            # Get the smallest decimal place of the first significant digit
-            # to print on the legend. The legend will print ('n_decimal'+1)
-            # decimal places.
-            # Set to 1 if the smallest number is bigger than 1.
+            # 最小桁数を計算して丸めの幅を決める
             smallest_shap = np.min(np.abs(shap_values).mean((1, 2)))
             if smallest_shap > 1:
                 n_decimals = 1
@@ -1102,6 +1148,8 @@ def summary_legacy(
                 label = f"{class_names[ind]} ({np.round(np.mean(global_shap_values),(n_decimals+1))})"
             else:
                 label = class_names[ind]
+
+            # 横向きバーを追加し、left_pos をずらしてスタック
             pl.barh(
                 y_pos, global_shap_values[feature_inds], 0.7, left=left_pos, align="center", color=color(i), label=label
             )
@@ -1110,7 +1158,10 @@ def summary_legacy(
         pl.gca().set_yticklabels([feature_names[i] for i in feature_inds])
         pl.legend(frameon=False, fontsize=12)
 
-    # draw the color bar
+
+    # -------------------------------------------------------------
+    # 4) カラーバーを描画 (bar 以外で必要なら)
+    # -------------------------------------------------------------
     if (
         color_bar
         and features is not None
@@ -1118,7 +1169,6 @@ def summary_legacy(
         and (plot_type != "layered_violin" or color in pl.colormaps)
     ):
         import matplotlib.cm as cm
-
         m = cm.ScalarMappable(cmap=cmap if plot_type != "layered_violin" else pl.get_cmap(color))
         m.set_array([0, 1])
         cb = pl.colorbar(m, ax=pl.gca(), ticks=[0, 1], aspect=80)
@@ -1127,25 +1177,30 @@ def summary_legacy(
         cb.ax.tick_params(labelsize=11, length=0)
         cb.set_alpha(1)
         cb.outline.set_visible(False)  # type: ignore
-    #         bbox = cb.ax.get_window_extent().transformed(pl.gcf().dpi_scale_trans.inverted())
-    #         cb.ax.set_aspect((bbox.height - 0.9) * 20)
-    # cb.draw_all()
 
+    # -------------------------------------------------------------
+    # 5) 軸の設定などを行い、plot を整形して終了
+    # -------------------------------------------------------------
     pl.gca().xaxis.set_ticks_position("bottom")
     pl.gca().yaxis.set_ticks_position("none")
     pl.gca().spines["right"].set_visible(False)
     pl.gca().spines["top"].set_visible(False)
     pl.gca().spines["left"].set_visible(False)
     pl.gca().tick_params(color=axis_color, labelcolor=axis_color)
+
+    # y軸目盛を feature_order に対応づけたラベルに更新
     pl.yticks(range(len(feature_order)), [feature_names[i] for i in feature_order], fontsize=13)
+
+    # bar の場合は X軸ラベルを「Global Value」に、それ以外は「Value」に
     if plot_type != "bar":
         pl.gca().tick_params("y", length=20, width=0.5, which="major")
-    pl.gca().tick_params("x", labelsize=11)
-    pl.ylim(-1, len(feature_order))
-    if plot_type == "bar":
-        pl.xlabel(labels["GLOBAL_VALUE"], fontsize=13)
-    else:
         pl.xlabel(labels["VALUE"], fontsize=13)
+    else:
+        pl.xlabel(labels["GLOBAL_VALUE"], fontsize=13)
+
+    # プロットの余白を整える
     pl.tight_layout()
+
+    # 最後に show=True なら表示
     if show:
         pl.show()
