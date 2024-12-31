@@ -89,7 +89,8 @@ class MetaExplanation(type):
 
 
 class Explanation(metaclass=MetaExplanation):
-    """A sliceable set of parallel arrays representing a SHAP explanation.
+    """
+    A sliceable set of parallel arrays representing a SHAP explanation.
 
     Notes
     -----
@@ -118,43 +119,62 @@ class Explanation(metaclass=MetaExplanation):
         clustering=None,
         compute_time=None,
     ):
+        # Explanation オブジェクトの生成時に呼ばれる初期化メソッド。
+        # パラメータとして、SHAP 値 (values) のほか、ベースライン, 元の特徴量データ,
+        # 表示用データ, 特徴量名, 出力名, クラスタリング情報など、多数の引数を取る。
+        #
+        # shap.Explanationの役割:
+        # SHAP値や関連するメタデータを統合管理し、スライス/演算/可視化を容易にする。
+
         self.op_history: list[OpHistoryItem] = []
+        # op_history: 操作履歴を記録するためのリスト。
+        # Explanationオブジェクトに対して行われた各種演算などを保持して、
+        # 後から何が行われたか追跡できるようにする仕組み。
 
         self.compute_time = compute_time
+        # compute_time: SHAP値の計算にかかった時間などを保持したい場合に使うオプション。
 
-        # TODO: better cloning :)
+        # --- 以下、values 引数がすでに Explanation 型だった場合の特別処理 ---
         if isinstance(values, Explanation):
             e = values
             values = e.values
             base_values = e.base_values
             data = e.data
+            # もし 'values' に Explanation が渡されていたら、
+            # その中身を展開して使う (今作っている Explanation に転写する形)。
 
+        # output_dims を決定するための補助関数を呼び出し (下部で定義)
         self.output_dims = compute_output_dims(values, base_values, data, output_names)
+
+        # 変数 values_shape: values の shape をタプル形式で得る (_compute_shape 参照)
         values_shape = _compute_shape(values)
 
+        # output_names が指定されていなければ、自動生成するケース (単一出力の場合など)
         if output_names is None and len(self.output_dims) == 1:
             num_names = values_shape[self.output_dims[0]]
             assert num_names is not None, "Unexpected shape of values"
             output_names = [f"Output {i}" for i in range(num_names)]
+            # 例: ["Output 0", "Output 1", ...] のような名前リスト
 
+        # feature_names が 1次元の配列として与えられている場合、slicer で使うため Alias 化する
         if (
             len(_compute_shape(feature_names)) == 1
         ):  # TODO: should always be an alias once slicer supports per-row aliases
             if len(values_shape) >= 2 and len(feature_names) == values_shape[1]:
+                # 特徴量数 == values.shape[1] のとき -> Alias(..., dim=1)
                 feature_names = Alias(list(feature_names), 1)
             elif len(values_shape) >= 1 and len(feature_names) == values_shape[0]:
+                # 特徴量数 == values.shape[0] のとき -> Alias(..., dim=0)
                 feature_names = Alias(list(feature_names), 0)
 
+        # output_names が 1次元配列なら、Alias化しておく (上と同様)
         if (
             len(_compute_shape(output_names)) == 1
         ):  # TODO: should always be an alias once slicer supports per-row aliases
             output_names = Alias(list(output_names), self.output_dims[0])
-            # if len(values_shape) >= 1 and len(output_names) == values_shape[0]:
-            #     output_names = Alias(list(output_names), 0)
-            # elif len(values_shape) >= 2 and len(output_names) == values_shape[1]:
-            #     output_names = Alias(list(output_names), 1)
 
-        if output_names is not None and not isinstance(output_names, Alias):
+        # output_names がより高次元の場合 (2Dなど) は、Obj(...) 化して保持
+        elif output_names is not None and not isinstance(output_names, Alias):
             output_names_order = len(_compute_shape(output_names))
             if output_names_order == 0:
                 pass
@@ -165,6 +185,7 @@ class Explanation(metaclass=MetaExplanation):
             else:
                 raise ValueError("shap.Explanation does not yet support output_names of order greater than 3!")
 
+        # base_values が配列の場合に、それを Obj(...) 化しておく (出力次元に合わせてセット)
         if not hasattr(base_values, "__len__") or len(base_values) == 0:
             pass
         elif len(_compute_shape(base_values)) == len(self.output_dims):
@@ -172,6 +193,7 @@ class Explanation(metaclass=MetaExplanation):
         else:
             base_values = Obj(base_values, [0] + list(self.output_dims))
 
+        # slicer.Slicer オブジェクトを生成し、各配列 (values, data, feature_names 等) を一括管理
         self._s = Slicer(
             values=values,
             base_values=base_values,
@@ -188,21 +210,26 @@ class Explanation(metaclass=MetaExplanation):
             hierarchical_values=list_wrap(hierarchical_values),
             clustering=None if clustering is None else Obj(clustering, [0]),
         )
+        # 上記で、(values, base_values, data, feature_names, ...) を
+        # Slicerにまとめて登録。Slicerは「インデックススライスや形状変換を一括で扱う」仕組み。
 
     # =================== Slicer passthrough ===================
 
     @property
     def values(self):
         """Pass-through from the underlying slicer object."""
+        # self._s (Slicer) が管理している 'values' (SHAP値本体) を返すプロパティ。
         return self._s.values
 
     @values.setter
     def values(self, new_values):
+        # Slicer内の 'values' を書き換えるセッター。
         self._s.values = new_values
 
     @property
     def base_values(self):
         """Pass-through from the underlying slicer object."""
+        # ベースライン予測値などを保持する配列 (base_values) へアクセスするプロパティ。
         return self._s.base_values
 
     @base_values.setter
@@ -212,6 +239,7 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def data(self):
         """Pass-through from the underlying slicer object."""
+        # 元の特徴量データ (ex: X_test) へのアクセサ。
         return self._s.data
 
     @data.setter
@@ -221,10 +249,12 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def display_data(self):
         """Pass-through from the underlying slicer object."""
+        # 可視化用に整形したデータ (ときには生データと違う場合がある)。
         return self._s.display_data
 
     @display_data.setter
     def display_data(self, new_display_data):
+        # もし pandas DataFrame なら、 `.values` で配列化して保存
         if isinstance(new_display_data, pd.DataFrame):
             new_display_data = new_display_data.values
         self._s.display_data = new_display_data
@@ -232,11 +262,13 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def instance_names(self):
         """Pass-through from the underlying slicer object."""
+        # 各サンプル(インスタンス)の名前 (ex: 行ラベル) へのアクセサ。
         return self._s.instance_names
 
     @property
     def output_names(self):
         """Pass-through from the underlying slicer object."""
+        # 多クラス出力などで、出力次元に対応する名前リストを返す。
         return self._s.output_names
 
     @output_names.setter
@@ -246,11 +278,13 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def output_indexes(self):
         """Pass-through from the underlying slicer object."""
+        # 出力次元のインデックス情報を返す (多クラスなど)。
         return self._s.output_indexes
 
     @property
     def feature_names(self):
         """Pass-through from the underlying slicer object."""
+        # 特徴量の名前一覧を返す。
         return self._s.feature_names
 
     @feature_names.setter
@@ -260,21 +294,25 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def lower_bounds(self):
         """Pass-through from the underlying slicer object."""
+        # SHAP値の下界 (confidence interval の下限など) を返す (オプション機能)。
         return self._s.lower_bounds
 
     @property
     def upper_bounds(self):
         """Pass-through from the underlying slicer object."""
+        # SHAP値の上界 (confidence interval の上限など) を返す (オプション機能)。
         return self._s.upper_bounds
 
     @property
     def error_std(self):
         """Pass-through from the underlying slicer object."""
+        # SHAP値の標準誤差などを保持できるフィールド。 (オプション機能)
         return self._s.error_std
 
     @property
     def main_effects(self):
         """Pass-through from the underlying slicer object."""
+        # main_effects: SHAPの2次・3次相互作用を考慮するとき、個々の主効果を別途保持するオプション。
         return self._s.main_effects
 
     @main_effects.setter
@@ -284,6 +322,7 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def hierarchical_values(self):
         """Pass-through from the underlying slicer object."""
+        # 階層構造での SHAP値を保持 (例: 特徴量が階層クラスタリングされている場合など)。
         return self._s.hierarchical_values
 
     @hierarchical_values.setter
@@ -293,6 +332,7 @@ class Explanation(metaclass=MetaExplanation):
     @property
     def clustering(self):
         """Pass-through from the underlying slicer object."""
+        # 特徴量のクラスタリング情報 (階層的クラスタツリーなど) を返す。
         return self._s.clustering
 
     @clustering.setter
@@ -302,6 +342,8 @@ class Explanation(metaclass=MetaExplanation):
     # =================== Data model ===================
     def __repr__(self):
         """Display some basic printable info, but not everything."""
+        # print() や 変数参照で表示されるときの表現を定義。
+        # 主に .values, .base_values, .data の簡単な内容を表示する。
         out = f".values =\n{self.values!r}"
         if self.base_values is not None:
             out += f"\n\n.base_values =\n{self.base_values!r}"
@@ -311,30 +353,40 @@ class Explanation(metaclass=MetaExplanation):
 
     def __getitem__(self, item) -> Explanation:
         """This adds support for OpChain indexing."""
+        # ex: explanation[0], explanation[:, 5], explanation[..., 'feature_name'] などを可能にする。
+        # Slicer を使って複数の配列を一貫してスライスし、新しい Explanation を返す。
+        #
+        # `OpChain` や Magic string 等を解釈する仕組みが入り混じり、複雑な実装になっている。
+
         new_self = None
+
+        # item がタプルじゃない場合はタプルに変換 (ex: item = (item,))
         if not isinstance(item, tuple):
             item = (item,)
 
-        # convert any OpChains or magic strings
+        # ループ内で必要に応じて OpChain を apply したり、Explanation を展開したり、2Dの feature_names, output_names の特殊処理などを行う。
         pos = -1
         for t in item:
             pos += 1
-
-            # skip over Ellipsis
             if t is Ellipsis:
+                # Ellipsis (...) があれば、shape 調整 (ndim が足りないときの埋め合わせ) として扱う。
                 pos += len(self.shape) - len(item)
                 continue
 
             orig_t = t
             if isinstance(t, OpChain):
+                # OpChain の場合: t = t.apply(self) で実際のインデックスに変換する。
                 t = t.apply(self)
-                if isinstance(t, (np.int64, np.int32)):  # because slicer does not like numpy indexes
+                if isinstance(t, (np.int64, np.int32)): 
                     t = int(t)
                 elif isinstance(t, np.ndarray):
-                    t = [int(v) for v in t]  # slicer wants lists not numpy arrays for indexing
+                    t = [int(v) for v in t]
             elif isinstance(t, Explanation):
+                # Explanation がスライスとして来た場合は t.values を用いる。
                 t = t.values
             elif isinstance(t, str):
+                # 文字列の場合: 多次元 output_names や feature_names の検索などを行うこともある。
+                # ここで新しい Explanation(new_self)を生成し、2Dに対応する場合がある。
                 # work around for 2D output_names since they are not yet slicer supported
                 output_names_dims = []
                 if "output_names" in self._s._objects:
@@ -408,29 +460,35 @@ class Explanation(metaclass=MetaExplanation):
                 tmp[pos] = t
                 item = tuple(tmp)
 
-        # call slicer for the real work
-        item = tuple(v for v in item)  # SML I cut out: `if not isinstance(v, str)`
+        # 上記で整形された item を Slicer による本来のスライスに渡す
+        item = tuple(v for v in item)
+
         if len(item) == 0:
-            return new_self  # type: ignore
+            # item が空になった場合は上記の処理で new_self ができていればそれを返す
+            return new_self
+
         if new_self is None:
             new_self = copy.copy(self)
+
         new_self._s = new_self._s.__getitem__(item)
         new_self.op_history.append(OpHistoryItem(name="__getitem__", args=(item,), prev_shape=self.shape))
-
         return new_self
 
     @property
     def shape(self) -> tuple[int, ...]:
         """Compute the shape over potentially complex data nesting."""
+        # .values (SHAP値配列) の shape を _compute_shape() で求め、返す。
+        # Explanationの一次元目がサンプル数、二次元目が特徴量数、三次元目が出力次元...といった概念。
         shap_values_shape = _compute_shape(self._s.values)
-        # impl: `Explanation.values` always corresponds to the shap values, which is a numpy array, so the
-        # shape will always be of tuple[int, ...] type, not tuple[int|None, ...].
         return cast(tuple[int, ...], shap_values_shape)
 
     def __len__(self):
-        return self.shape[0]
-
+        # len(explanation) で返す値 -> shape[0] (サンプル数) と想定
+        return self.shape[0]    
+    
     def __copy__(self) -> Explanation:
+        # Python の copy.copy() を呼び出したときの処理。
+        # ほとんどのフィールドを複製し、別の Slicer を持つ新しい Explanation を返す。
         new_exp = Explanation(
             self.values,
             base_values=self.base_values,
@@ -453,9 +511,12 @@ class Explanation(metaclass=MetaExplanation):
     # =================== Operations ===================
 
     def _apply_binary_operator(self, other, binary_op, op_name):
+        # 二項演算 ( +, -, *, / ) を実装するための共通関数。
+        # `binary_op` は operator.add 等が渡される。
         new_exp = self.__copy__()
         new_exp.op_history.append(OpHistoryItem(name=op_name, args=(other,), prev_shape=self.shape))
 
+        # other が Explanation なら、両者の values / data / base_values を演算
         if isinstance(other, Explanation):
             new_exp.values = binary_op(new_exp.values, other.values)
             if new_exp.data is not None:
@@ -463,6 +524,7 @@ class Explanation(metaclass=MetaExplanation):
             if new_exp.base_values is not None:
                 new_exp.base_values = binary_op(new_exp.base_values, other.base_values)
         else:
+            # other がスカラー/配列などのケース
             new_exp.values = binary_op(new_exp.values, other)
             if new_exp.data is not None:
                 new_exp.data = binary_op(new_exp.data, other)
@@ -492,38 +554,46 @@ class Explanation(metaclass=MetaExplanation):
         return self._apply_binary_operator(other, operator.truediv, "__truediv__")
 
     def _numpy_func(self, fname, **kwargs):
-        """Apply a numpy-style function to this Explanation."""
+        """
+        Apply a numpy-style function to this Explanation.
+        例: mean, max, min, sum などを numpy 関数として適用する共通処理。
+        """
         new_self = copy.copy(self)
         axis = kwargs.get("axis", None)
 
-        # collapse the slicer to right shape
+        # axis を指定している場合、indexing などで一度スライスすることがある
         if axis in [0, 1, 2]:
             new_self = new_self[axis]
-            new_self.op_history = new_self.op_history[:-1]  # pop off the slicing operation we just used
+            new_self.op_history = new_self.op_history[:-1]  # 直前の __getitem__ の履歴を削除
 
+        # もし feature_names が 2次元などの場合、軸 = 0 のときに flatten する操作などがある
         if self.feature_names is not None and not is_1d(self.feature_names) and axis == 0:
             new_values = self._flatten_feature_names()
             new_self.feature_names = np.array(list(new_values.keys()))
             new_self.values = np.array([getattr(np, fname)(v, 0) for v in new_values.values()])
             new_self.clustering = None
         else:
+        # 実際の値 (values / data / base_values) に対して numpy の fname (ex: np.mean) を適用
             new_self.values = getattr(np, fname)(np.array(self.values), **kwargs)
             if new_self.data is not None:
                 try:
                     new_self.data = getattr(np, fname)(np.array(self.data), **kwargs)
                 except Exception:
                     new_self.data = None
+            # base_values の集約処理 (axis指定時には base_values を collapse するなど)
             if new_self.base_values is not None and isinstance(axis, int) and len(self.base_values.shape) > axis:
                 new_self.base_values = getattr(np, fname)(self.base_values, **kwargs)
             elif isinstance(axis, int):
                 new_self.base_values = None
 
+        # clustering 情報が 3次元だったりする場合は破棄するなどの処理
         if axis == 0 and self.clustering is not None and len(self.clustering.shape) == 3:
             if self.clustering.std(0).sum() < 1e-8:
                 new_self.clustering = self.clustering[0]
             else:
                 new_self.clustering = None
 
+        # op_history に記録を追加
         new_self.op_history.append(
             OpHistoryItem(
                 name=fname,
@@ -537,34 +607,43 @@ class Explanation(metaclass=MetaExplanation):
 
     @property
     def abs(self):
+        #  Explanation の各要素に対して絶対値を取る操作。
         return self._numpy_func("abs")
 
     @property
     def identity(self):
+        # 何もしない no-op 操作。
         return self
 
     @property
     def argsort(self):
+        # Numpy の argsort と同じような操作を行う。
         return self._numpy_func("argsort")
 
     @property
     def flip(self):
+        # Numpy の flip と同じような操作を行う。
         return self._numpy_func("flip")
 
     def mean(self, axis: int):
         """Numpy-style mean function."""
+        # Numpy の mean と同じような操作を行う。
         return self._numpy_func("mean", axis=axis)
 
     def max(self, axis: int):
-        """Numpy-style mean function."""
+        """Numpy-style max function."""
+        # Numpy の max と同じような操作を行う。
         return self._numpy_func("max", axis=axis)
 
     def min(self, axis: int):
-        """Numpy-style mean function."""
+        """Numpy-style min function."""
+        # Numpy の min と同じような操作を行う。
         return self._numpy_func("min", axis=axis)
 
     def sum(self, axis: int | None = None, grouping=None):
         """Numpy-style sum function."""
+        # Numpy の sum と同じような操作を行う。
+        # grouping が指定されていれば、特徴量をグループ化して合算する (例: 部分的に特徴量をまとめる)
         if grouping is None:
             return self._numpy_func("sum", axis=axis)
         if axis == 1 or len(self.shape) == 1:
@@ -572,7 +651,10 @@ class Explanation(metaclass=MetaExplanation):
         raise DimensionError("Only axis = 1 is supported for grouping right now...")
 
     def percentile(self, q, axis=None) -> Explanation:
+        # np.percentile と同等の操作を行うメソッド
         new_self = copy.deepcopy(self)
+        # 2次元 feature_names を flatten する場合などのロジックあり
+        # main部分は new_self.values = np.percentile(new_self.values, q, axis)
         if self.feature_names is not None and not is_1d(self.feature_names) and axis == 0:
             new_values = self._flatten_feature_names()
             new_self.feature_names = np.array(list(new_values.keys()))
@@ -608,6 +690,9 @@ class Explanation(metaclass=MetaExplanation):
             Random seed to use for sampling, defaults to 0.
 
         """
+        """
+        ランダムサンプリング (行方向) で Explanation オブジェクトをスライスし、サブセットを返す。
+        """
         rng = np.random.RandomState(random_state)
         length = self.shape[0]
         assert length is not None
@@ -628,6 +713,10 @@ class Explanation(metaclass=MetaExplanation):
             The axis to cluster along.
 
         """
+        """
+        ヒエラルキークラスタリング (hclust) を行い、最適な順序を返す (インデックス順)。
+        SHAP値が 2次元である必要あり (shape=(サンプル数, 特徴量数)など)。
+        """
         values = self.values
 
         if len(values.shape) != 2:
@@ -641,18 +730,9 @@ class Explanation(metaclass=MetaExplanation):
     # =================== Utilities ===================
 
     def hstack(self, other: Explanation) -> Explanation:
-        """Stack two explanations column-wise.
-
-        Parameters
-        ----------
-        other : shap.Explanation
-            The other Explanation object to stack with.
-
-        Returns
-        -------
-        exp : shap.Explanation
-            A new Explanation object representing the stacked explanations.
-
+        """
+        2つの Explanation を列方向 (特徴量方向) に結合する。
+        values, data, feature_names 等を結合するため、shape[0] (サンプル数) が同じである必要がある。
         """
         assert self.shape[0] == other.shape[0], "Can't hstack explanations with different numbers of rows!"
         if not np.allclose(self.base_values, other.base_values, atol=1e-6):
@@ -677,24 +757,14 @@ class Explanation(metaclass=MetaExplanation):
         return new_exp
 
     def cohorts(self, cohorts: int | list[int] | tuple[int] | np.ndarray) -> Cohorts:
-        """Split this explanation into several cohorts.
-
-        Parameters
-        ----------
-        cohorts : int or array
-            If this is an integer then we auto build that many cohorts using a decision tree. If this is
-            an array then we treat that as an array of cohort names/ids for each instance.
-
-        Returns
-        -------
-        Cohorts object
-
+        """
+        Explanation オブジェクトを複数の cohort (グループ) に分割し、Cohorts オブジェクトを返す。
+        cohorts が int の場合、決定木を使って自動的にサンプルをグループ分けする。
+        cohorts が array の場合、その要素ごとにグループを分ける。
         """
         if self.values.ndim > 2:
             raise ValueError(
-                "Cohorts cannot be calculated on multiple outputs at once. "
-                "Please make sure to specify the output index on which cohorts should be build, e.g. for a multi-class output "
-                "shap_values[..., cohort_class].cohorts(2)."
+                "Cohorts cannot be calculated on multiple outputs at once. ..."
             )
         if isinstance(cohorts, int):
             return _auto_cohorts(self, max_cohorts=cohorts)
@@ -704,6 +774,9 @@ class Explanation(metaclass=MetaExplanation):
         raise TypeError("The given set of cohort indicators is not recognized! Please give an array or int.")
 
     def _flatten_feature_names(self) -> dict:
+        """
+        feature_names が 2D の場合に、行方向にある重複をまとめたりするための内部メソッド。
+        """
         new_values: dict[Any, Any] = {}
         for i in range(len(self.values)):
             for s, v in zip(self.feature_names[i], self.values[i]):
@@ -713,6 +786,9 @@ class Explanation(metaclass=MetaExplanation):
         return new_values
 
     def _use_data_as_feature_names(self):
+        """
+        data を feature_names の代わりに使う場合の内部メソッド (2D対応)。
+        """
         new_values: dict[Any, Any] = {}
         for i in range(len(self.values)):
             for s, v in zip(self.data[i], self.values[i]):
@@ -720,6 +796,8 @@ class Explanation(metaclass=MetaExplanation):
                     new_values[s] = []
                 new_values[s].append(v)
         return new_values
+
+# クラスの終わり
 
 
 def group_features(shap_values, feature_map) -> Explanation:
