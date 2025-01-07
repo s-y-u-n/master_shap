@@ -18,5 +18,18 @@ model.fit(X_train, y_train)
 explainer = shap.Explainer(model)
 shap_values = explainer(X_test)
 
+print(model)
+
+# shap_values have [.values, .base_values, .data]
+# .values = array([[-0.47621608,  0.00522793, -0.11823769, ..., -0.37759832],
+#                  [-0.5051474 ,  0.02292835, -0.11505361, ...,-0.22896677],
+#                   ...])
+# .base_values = array([2.0718894, 2.0718894, 2.0718894, ..., 2.0718894], dtype=float32)
+# .data = array([[1.6812, 25., 4.19220056, ..., -119.01],
+#                [2.5313, 30., 5.03938356, ..., -119.46],
+#                ...])
+
+"""
 # SHAP値のプロット
 shap.summary_plot(shap_values, X_test, feature_names=california.feature_names)
+"""

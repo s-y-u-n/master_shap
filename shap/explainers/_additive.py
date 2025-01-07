@@ -116,14 +116,20 @@ class AdditiveExplainer(Explainer):
         単一のサンプル(row_args[0])に対して SHAP 値(=各特徴量の寄与)を計算し、辞書形式で返す。
         """
         x = row_args[0]
-        # inputs行列を対角に x[i] を配置し、それ以外は0にする。
-        #   => 「特定の特徴量 i だけ本来の値を使い、他は 0(=OFF)」という入力を複数行作るイメージ。
+        # 1. inputs行列を対角に x[i] を配置し、それ以外は0にする。
+            #   => 「特定の特徴量 i だけ本来の値を使い、他は 0(=OFF)」という入力を複数行作るイメージ。
+            # x = [10, 5, 2]  の場合、以下のような inputs 行列ができる
+            #   [[10, 0, 0],
+            #    [0, 5, 0],
+            #    [0, 0, 2]]
         inputs = np.zeros((len(x), len(x)))
         for i in range(len(x)):
             inputs[i, i] = x[i]
 
         # モデルにこれらの inputs を通し、_zero_offset や _input_offsets との比較で寄与度(phi)を計算
         phi = self.model(inputs) - self._zero_offset - self._input_offsets
+
+        print(f"phi: {phi}")
 
         # SHAP では "values" が寄与度、"expected_values" がベースラインに相当
         return {

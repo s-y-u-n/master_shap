@@ -15,82 +15,39 @@ from ._explainer import Explainer
 
 
 class LinearExplainer(Explainer):
-    """Computes SHAP values for a linear model, optionally accounting for inter-feature correlations.
+    """
+    Computes SHAP values for a linear model, optionally accounting for inter-feature correlations.
 
-    This computes the SHAP values for a linear model and can account for the
-    correlations among the input features. Assuming features are independent
-    leads to interventional SHAP values which for a linear model are ``coef[i] *
-    (x[i] - X.mean(0)[i])`` for the ith feature. If instead we account for
-    correlations, then we prevent any problems arising from collinearity and
-    share credit among correlated features. Accounting for correlations can be
-    computationally challenging, but ``LinearExplainer`` uses sampling to
-    estimate a transform that can then be applied to explain any prediction of
-    the model.
+    これは線形モデルの SHAP 値を計算するためのクラス。
+    相関のないケース(“interventional”) と、
+    特徴量間の相関(“correlation_dependent”) を考慮するケースの両方をサポートする。
 
     Parameters
     ----------
     model : (coef, intercept) or sklearn.linear_model.*
-        User supplied linear model either as either a parameter pair or sklearn object.
+        ユーザーが与える線形モデル。 (w, b) のタプルか、sklearnの線形モデルオブジェクト。
 
-    masker : function, numpy.array, pandas.DataFrame, tuple of (mean, cov), shap.maskers.Masker
-        A callable Python object used to "mask" out hidden features of the form
-        ``masker(binary_mask, x)``. It takes a single input sample and a binary
-        mask and returns a matrix of masked samples. These masked samples are
-        evaluated using the model function and the outputs are then averaged.
+    masker : function, numpy.array, pandas.DataFrame, tuple(mean, cov), shap.maskers.Masker
+        特徴量をマスクする仕組み or 背景データ（平均・共分散を持つ）など。
 
-        As a shortcut for the standard masking using by SHAP you can pass a
-        background data matrix instead of a function and that matrix will be
-        used for masking.
-
-        You can also provide a tuple of ``(mean, covariance)``, or pass in a
-        masker meant for tabular data (i.e., :class:`.maskers.Independent`,
-        :class:`.maskers.Impute`, or :class:`.maskers.Partition`) directly.
-
-    data : (mean, cov), numpy.array, pandas.DataFrame, iml.DenseData or scipy.csr_matrix
-        The background dataset to use for computing conditional expectations.
-        Note that only the mean and covariance of the dataset are used. This
-        means passing a raw data matrix is just a convenient alternative to
-        passing the mean and covariance directly.
+    data : (mean, cov), numpy.array, pandas.DataFrame, ...
+        背景データ。ここから平均や共分散を取得し、(X - mean) により SHAP 値を計算などを行う。
 
     nsamples : int
-        Number of samples to use when estimating the transformation matrix used
-        to account for feature correlations.
+        相関付き計算で使うサンプリング回数。デフォルト 1000。
 
-    feature_perturbation : None (default), "interventional" or "correlation_dependent"
-
-        DEPRECATED: this option is now deprecated in favor of using the appropriate
-        tabular masker and will be removed in a future release.
-
-        There are two ways we might want to compute SHAP values, either the full
-        conditional SHAP values or the interventional SHAP values.
-
-        - For interventional SHAP values we break any dependence structure between
-          features in the model and so uncover how the model would behave if we
-          intervened and changed some of the inputs. This approach is used by the
-          Independent and Partition maskers.
-        - For the full conditional SHAP values we respect the correlations among the
-          input features, so if the model depends on one input but that input is
-          correlated with another input, then both get some credit for the model's
-          behavior. This approach is used by the Impute masker.
-
-        The interventional option stays "true to the model" meaning it will only
-        give credit to features that are actually used by the model, while the
-        correlation option stays "true to the data" in the sense that it only
-        considers how the model would behave when respecting the correlations in
-        the input data. For sparse case only interventional option is supported.
-
-
-    Examples
-    --------
-    See `Linear explainer examples <https://shap.readthedocs.io/en/latest/api_examples/explainers/LinearExplainer.html>`_
-
+    feature_perturbation : "interventional" or "correlation_dependent" or None
+        特徴量の相関を無視する(interventional)か、考慮する(correlation_dependent)かを指定する。
+        Noneの場合は内部で "interventional" が選択される。
     """
 
     def __init__(self, model, masker, link=links.identity, nsamples=1000, feature_perturbation=None, **kwargs):
+        # --- 1) feature_dependence -> feature_perturbation への改名対応 ---
         if "feature_dependence" in kwargs:
             emsg = "The option feature_dependence has been renamed to feature_perturbation!"
             raise ValueError(emsg)
 
+        # --- 2) feature_perturbation が指定された場合のWarning (互換性のため) ---
         if feature_perturbation is not None:  # pragma: no cover
             wmsg = (
                 "The feature_perturbation option is now deprecated in favor of using the appropriate "
@@ -100,14 +57,13 @@ class LinearExplainer(Explainer):
         else:
             feature_perturbation = "interventional"
 
+        # interventional or correlation_dependent 以外ならエラー
         if feature_perturbation not in ("interventional", "correlation_dependent"):
             emsg = "feature_perturbation must be one of 'interventional' or 'correlation_dependent'"
             raise InvalidFeaturePerturbationError(emsg)
         self.feature_perturbation = feature_perturbation
 
-        # wrap the incoming masker object as a shap.Masker object before calling
-        # parent class constructor, which does the same but without respecting
-        # the user-provided feature_perturbation choice
+        # --- 3) masker を適切な maskers.* クラスにラップする (DataFrame → Impute/Independent 等) ---
         if isinstance(masker, pd.DataFrame) or (
             (isinstance(masker, np.ndarray) or issparse(masker)) and len(masker.shape) == 2
         ):
@@ -116,19 +72,21 @@ class LinearExplainer(Explainer):
             else:
                 masker = maskers.Independent(masker)
         elif issubclass(type(masker), tuple) and len(masker) == 2:
+            # (mean, cov) タプルの場合
             if self.feature_perturbation == "correlation_dependent":
                 masker = maskers.Impute({"mean": masker[0], "cov": masker[1]}, method="linear")
             else:
                 masker = maskers.Independent({"mean": masker[0], "cov": masker[1]})
 
+        # --- 4) 親クラスExplainerの __init__ 呼び出し (モデルやmasker設定) ---
         super().__init__(model, masker, link=link, **kwargs)
 
         self.nsamples = nsamples
 
-        # extract what we need from the given model object
+        # --- 5) モデルから (coef, intercept) を取り出す ---
         self.coef, self.intercept = LinearExplainer._parse_model(model)
 
-        # extract the data
+        # --- 6) マスカーの種類を見て feature_perturbation を確定し、背景データを取得する ---
         if issubclass(type(self.masker), (maskers.Independent, maskers.Partition)):
             self.feature_perturbation = "interventional"
         elif issubclass(type(self.masker), maskers.Impute):
@@ -139,11 +97,11 @@ class LinearExplainer(Explainer):
             )
         data = getattr(self.masker, "data", None)
 
-        # convert DataFrame's to numpy arrays
+        # pandas.DataFrameなら ndarrayに変換
         if isinstance(data, pd.DataFrame):
             data = data.values
 
-        # get the mean and covariance of the model
+        # --- 7) mean/cov の取得: maskerに mean, cov があるか、data が (mean, cov)か 等を判定 ---
         if getattr(self.masker, "mean", None) is not None:
             self.mean = self.masker.mean
             self.cov = self.masker.cov
@@ -166,6 +124,7 @@ class LinearExplainer(Explainer):
         elif data is None:
             raise ValueError("A background data distribution must be provided!")
         else:
+            # 通常の array か sparse か
             if issparse(data):
                 self.mean = np.array(np.mean(data, 0))[0]
                 if self.feature_perturbation != "interventional":
@@ -173,18 +132,14 @@ class LinearExplainer(Explainer):
                         "Only feature_perturbation = 'interventional' is supported for sparse data"
                     )
             else:
-                self.mean = np.array(np.mean(data, 0)).flatten()  # assumes it is an array
+                self.mean = np.array(np.mean(data, 0)).flatten()
                 if self.feature_perturbation == "correlation_dependent":
                     self.cov = np.cov(data, rowvar=False)
-        # print(self.coef, self.mean.flatten(), self.intercept)
-        # Note: mean can be numpy.matrixlib.defmatrix.matrix or numpy.matrix type depending on numpy version
-        if issparse(self.mean) or str(type(self.mean)).endswith("matrix'>"):
-            # accept both sparse and dense coef
-            # if not issparse(self.coef):
-            #     self.coef = np.asmatrix(self.coef)
-            self.expected_value = np.dot(self.coef, self.mean) + self.intercept
 
-            # unwrap the matrix form
+        # --- 8) mean と coef で expected_value を計算 (f(mean) = coef • mean + intercept) ---
+        if issparse(self.mean) or str(type(self.mean)).endswith("matrix'>"):
+            # sparseやmatrix型に対応
+            self.expected_value = np.dot(self.coef, self.mean) + self.intercept
             if len(self.expected_value) == 1:
                 self.expected_value = self.expected_value[0, 0]
             else:
@@ -194,28 +149,31 @@ class LinearExplainer(Explainer):
 
         self.M = len(self.mean)
 
-        # if needed, estimate the transform matrices
+        # --- 9) correlation_dependent の場合、共分散行列を用いた補正を用意 ---
         if self.feature_perturbation == "correlation_dependent":
+            # 対角要素が小さい(=ほぼゼロ分散) の特徴量を除外
             self.valid_inds = np.where(np.diag(self.cov) > 1e-8)[0]
             self.mean = self.mean[self.valid_inds]
             self.cov = self.cov[:, self.valid_inds][self.valid_inds, :]
             self.coef = self.coef[self.valid_inds]
 
-            # group perfectly redundant variables together
+            # group perfectly redundant variables
             self.avg_proj, sum_proj = duplicate_components(self.cov)
             self.cov = np.matmul(np.matmul(self.avg_proj, self.cov), self.avg_proj.T)
             self.mean = np.matmul(self.avg_proj, self.mean)
             self.coef = np.matmul(sum_proj, self.coef)
 
-            # if we still have some multi-collinearity present then we just add regularization...
+            # 特異行列になりそうなら正則化 (1e-6 I を足す)
             e, _ = np.linalg.eig(self.cov)
             if e.min() < 1e-7:
                 self.cov = self.cov + np.eye(self.cov.shape[0]) * 1e-6
 
+            # サンプリングで 行列変換(mean_transform, x_transform) を推定
             mean_transform, x_transform = self._estimate_transforms(nsamples)
             self.mean_transformed = np.matmul(mean_transform, self.mean)
             self.x_transform = x_transform
         elif self.feature_perturbation == "interventional":
+            # nsamples は関与しないので Warning
             if nsamples != 1000:
                 warnings.warn("Setting nsamples has no effect when feature_perturbation = 'interventional'!")
         else:
@@ -224,35 +182,35 @@ class LinearExplainer(Explainer):
             )
 
     def _estimate_transforms(self, nsamples):
-        """Uses block matrix inversion identities to quickly estimate transforms.
+        """
+        Uses block matrix inversion identities to quickly estimate transforms.
 
-        After a bit of matrix math we can isolate a transform matrix (# features x # features)
-        that is independent of any sample we are explaining. It is the result of averaging over
-        all feature permutations, but we just use a fixed number of samples to estimate the value.
-
-        TODO: Do a brute force enumeration when # feature subsets is less than nsamples. This could
-              happen through a recursive method that uses the same block matrix inversion as below.
+        特徴量間の相関を考慮して SHAP 値を正しく割り当てるために、
+        部分的な行列逆や再帰的なアップデートをサンプリングしながら行い、
+        行列変換(mean_transform, x_transform) を推定する。
         """
         M = len(self.coef)
 
         mean_transform = np.zeros((M, M))
         x_transform = np.zeros((M, M))
         inds = np.arange(M, dtype=int)
+
         for _ in tqdm(range(nsamples), "Estimating transforms"):
             np.random.shuffle(inds)
             cov_inv_SiSi = np.zeros((0, 0))
             cov_Si = np.zeros((M, 0))
+
             for j in range(M):
                 i = inds[j]
 
-                # use the last Si as the new S
+                # cov_S, cov_inv_SS は "S" と呼ばれる部分集合に関する共分散やその逆行列
                 cov_S = cov_Si
                 cov_inv_SS = cov_inv_SiSi
 
-                # get the new cov_Si
+                # 新たに i を追加した S ∪ {i} の共分散行列などを取り出す
                 cov_Si = self.cov[:, inds[: j + 1]]
 
-                # compute the new cov_inv_SiSi from cov_inv_SS
+                # ブロック行列の逆行列を更新する手法 (Sherman–Morrison–Woodbury 近似に似た処理)
                 d = cov_Si[i, :-1].T
                 t = np.matmul(cov_inv_SS, d)
                 Z = self.cov[i, i]
@@ -263,24 +221,19 @@ class LinearExplainer(Explainer):
                     cov_inv_SiSi[:-1, -1] = cov_inv_SiSi[-1, :-1] = -t / u
                 cov_inv_SiSi[-1, -1] = 1 / u
 
-                # + coef @ (Q(bar(Sui)) - Q(bar(S)))
+                # mean_transform, x_transform の各要素を更新
+                # + coef @ R(Sui) や - coef @ R(S) など、
+                # どのようにSが拡張されるかを考慮しつつ寄与を加算
                 mean_transform[i, i] += self.coef[i]
 
-                # + coef @ R(Sui)
                 coef_R_Si = np.matmul(self.coef[inds[j + 1 :]], np.matmul(cov_Si, cov_inv_SiSi)[inds[j + 1 :]])
                 mean_transform[i, inds[: j + 1]] += coef_R_Si
 
-                # - coef @ R(S)
                 coef_R_S = np.matmul(self.coef[inds[j:]], np.matmul(cov_S, cov_inv_SS)[inds[j:]])
                 mean_transform[i, inds[:j]] -= coef_R_S
 
-                # - coef @ (Q(Sui) - Q(S))
                 x_transform[i, i] += self.coef[i]
-
-                # + coef @ R(Sui)
                 x_transform[i, inds[: j + 1]] += coef_R_Si
-
-                # - coef @ R(S)
                 x_transform[i, inds[:j]] -= coef_R_S
 
         mean_transform /= nsamples
@@ -289,15 +242,15 @@ class LinearExplainer(Explainer):
 
     @staticmethod
     def _parse_model(model):
-        """Attempt to pull out the coefficients and intercept from the given model object."""
-        # raw coefficients
+        """
+        モデルobj (sklearnかタプル) から coef, intercept を取り出す。
+        """
         if isinstance(model, tuple) and len(model) == 2:
             coef = model[0]
             intercept = model[1]
 
-        # sklearn style model
         elif hasattr(model, "coef_") and hasattr(model, "intercept_"):
-            # work around for multi-class with a single class
+            # shape が (1, n_features) みたいな可能性を考慮
             if len(model.coef_.shape) > 1 and model.coef_.shape[0] == 1:
                 coef = model.coef_[0]
                 try:
@@ -314,7 +267,9 @@ class LinearExplainer(Explainer):
 
     @staticmethod
     def supports_model_with_masker(model, masker):
-        """Determines if we can parse the given model."""
+        """
+        この explainer でモデルとマスカーの組み合わせを扱えるかどうかのチェック関数。
+        """
         if not isinstance(masker, (maskers.Independent, maskers.Partition, maskers.Impute)):
             return False
 
@@ -325,90 +280,61 @@ class LinearExplainer(Explainer):
         return True
 
     def explain_row(self, *row_args, max_evals, main_effects, error_bounds, batch_size, outputs, silent):
-        """Explains a single row and returns the tuple (row_values, row_expected_values, row_mask_shapes)."""
+        """
+        1サンプル(row_args[0])に対する SHAP 値を計算して辞書で返す。
+        """
         assert len(row_args) == 1, "Only single-argument functions are supported by the Linear explainer!"
 
         X = row_args[0]
         if len(X.shape) == 1:
             X = X.reshape(1, -1)
 
-        # convert dataframes
+        # DataFrame → ndarray 化
         if isinstance(X, (pd.Series, pd.DataFrame)):
             X = X.values
 
         if len(X.shape) not in (1, 2):
             raise DimensionError(f"Instance must have 1 or 2 dimensions! Not: {len(X.shape)}")
 
+        # correlation_dependentの場合 => (X - mean) に x_transform行列をかけてSHAP値を割り当て
         if self.feature_perturbation == "correlation_dependent":
             if issparse(X):
                 raise InvalidFeaturePerturbationError(
                     "Only feature_perturbation = 'interventional' is supported for sparse data"
                 )
             phi = (
-                np.matmul(np.matmul(X[:, self.valid_inds], self.avg_proj.T), self.x_transform.T) - self.mean_transformed
+                np.matmul(np.matmul(X[:, self.valid_inds], self.avg_proj.T), self.x_transform.T)
+                - self.mean_transformed
             )
             phi = np.matmul(phi, self.avg_proj)
 
+            # valid_inds を元にフルの形に戻す
             full_phi = np.zeros((phi.shape[0], self.M))
             full_phi[:, self.valid_inds] = phi
             phi = full_phi
 
         elif self.feature_perturbation == "interventional":
+            # 相関無視 => phi = (X - mean) * coef
             if issparse(X):
                 phi = np.array(np.multiply(X - self.mean, self.coef))
-
-                # if len(self.coef.shape) == 1:
-                #     return np.array(np.multiply(X - self.mean, self.coef))
-                # else:
-                #     return [np.array(np.multiply(X - self.mean, self.coef[i])) for i in range(self.coef.shape[0])]
             else:
                 phi = np.array(X - self.mean) * self.coef
-                # if len(self.coef.shape) == 1:
-                #     phi = np.array(X - self.mean) * self.coef
-                #     return np.array(X - self.mean) * self.coef
-                # else:
-                #     return [np.array(X - self.mean) * self.coef[i] for i in range(self.coef.shape[0])]
 
         return {
-            "values": phi.T,
-            "expected_values": self.expected_value,
-            "mask_shapes": (X.shape[1:],),
-            "main_effects": phi.T,
+            "values": phi.T,                 # shape (features, samples)
+            "expected_values": self.expected_value,  # baseline
+            "mask_shapes": (X.shape[1:],),   # 入力の形状 (特徴量数, ) など
+            "main_effects": phi.T,           # 相互作用は考慮していないので main_effects=phi
             "clustering": None,
         }
-
+    
     def shap_values(self, X):
-        """Estimate the SHAP values for a set of samples.
-
-        Parameters
-        ----------
-        X : numpy.array, pandas.DataFrame or scipy.csr_matrix
-            A matrix of samples (# samples x # features) on which to explain the model's output.
-
-        Returns
-        -------
-        np.array
-            Estimated SHAP values, usually of shape ``(# samples x # features)``.
-
-            Each row sums to the difference between the model output for that
-            sample and the expected value of the model output (which is stored
-            as the ``expected_value`` attribute of the explainer).
-
-            The shape of the returned array depends on the number of model outputs:
-
-            * one output: array of shape ``(#num_samples, *X.shape[1:])``.
-            * multiple outputs: array of shape ``(#num_samples, *X.shape[1:],
-              #num_outputs)``.
-
-            .. versionchanged:: 0.45.0
-                Return type for models with multiple outputs changed from list to np.ndarray.
-
         """
-        # convert dataframes
+        複数サンプルに対して SHAP 値を一括計算し返す。
+        """
         if isinstance(X, (pd.Series, pd.DataFrame)):
             X = X.values
 
-        # assert isinstance(X, np.ndarray), "Unknown instance type: " + str(type(X))
         if len(X.shape) not in (1, 2):
             raise DimensionError(f"Instance must have 1 or 2 dimensions! Not: {len(X.shape)}")
 
@@ -418,7 +344,8 @@ class LinearExplainer(Explainer):
                     "Only feature_perturbation = 'interventional' is supported for sparse data"
                 )
             phi = (
-                np.matmul(np.matmul(X[:, self.valid_inds], self.avg_proj.T), self.x_transform.T) - self.mean_transformed
+                np.matmul(np.matmul(X[:, self.valid_inds], self.avg_proj.T), self.x_transform.T)
+                - self.mean_transformed
             )
             phi = np.matmul(phi, self.avg_proj)
 
@@ -433,18 +360,25 @@ class LinearExplainer(Explainer):
                     return np.array(np.multiply(X - self.mean, self.coef))
                 else:
                     return np.stack(
-                        [np.array(np.multiply(X - self.mean, self.coef[i])) for i in range(self.coef.shape[0])], axis=-1
+                        [np.array(np.multiply(X - self.mean, self.coef[i])) for i in range(self.coef.shape[0])],
+                        axis=-1
                     )
             else:
                 if len(self.coef.shape) == 1:
+                    # シングル出力 => (num_samples, features)
                     return np.array(X - self.mean) * self.coef
                 else:
+                    # マルチ出力 => stacks
                     return np.stack(
-                        [np.array(X - self.mean) * self.coef[i] for i in range(self.coef.shape[0])], axis=-1
+                        [np.array(X - self.mean) * self.coef[i] for i in range(self.coef.shape[0])],
+                        axis=-1
                     )
 
-
 def duplicate_components(C):
+    """
+    共分散行列C 内でほぼ同一・冗長な成分を検出してグループ化する関数。
+    相関が1に近い特徴量同士をまとめるなどして行列を縮小。
+    """
     D = np.diag(1 / np.sqrt(np.diag(C)))
     C = np.matmul(np.matmul(D, C), D)
     components = -np.ones(C.shape[0], dtype=int)
