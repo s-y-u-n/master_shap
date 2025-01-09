@@ -5,7 +5,8 @@ from ._explainer import Explainer
 
 
 class AdditiveExplainer(Explainer):
-    """Computes SHAP values for generalized additive models.
+    """
+    Computes SHAP values for generalized additive models.
 
     This assumes that the model only has first-order effects. Extending this to
     second- and third-order effects is future work (if you apply this to those models right now
@@ -13,73 +14,96 @@ class AdditiveExplainer(Explainer):
     """
 
     def __init__(self, model, masker, link=None, feature_names=None, linearize_link=True):
-        """Build an Additive explainer for the given model using the given masker object.
+        """
+        指定されたモデルとマスカーを使って、加法的モデル向けのExplainerを構築する。
 
         Parameters
         ----------
         model : function
-            A callable python object that executes the model given a set of input data samples.
+            入力データを与えるとモデルの予測値(またはスコア)を返す関数。
+            interpret.glassbox.ExplainableBoostingClassifier のようなクラスでも可。
 
         masker : function or numpy.array or pandas.DataFrame
-            A callable python object used to "mask" out hidden features of the form ``masker(mask, *fargs)``.
-            It takes a single a binary mask and an input sample and returns a matrix of masked samples. These
-            masked samples are evaluated using the model function and the outputs are then averaged.
-            As a shortcut for the standard masking used by SHAP you can pass a background data matrix
-            instead of a function and that matrix will be used for masking. To use a clustering
-            game structure you can pass a ``shap.maskers.Tabular(data, hclustering="correlation")`` object, but
-            note that this structure information has no effect on the explanations of additive models.
+            特徴量をマスクするためのオブジェクトまたはデータ。
+            Independentマスカーなどを想定。特徴量を個別に無効化(0にする等)する仕組みを提供。
 
+        link : リンク関数 (デフォルト: None)
+            SHAP値をどのように変換するか。例：ロジット変換など
+
+        feature_names : 特徴量名のリスト (デフォルト: None)
+
+        linearize_link : bool
+            リンク関数を線形化するかどうかを指定するオプション(上位クラスExplainer側に渡す)。
         """
+        # 親クラスExplainerのコンストラクタを呼ぶ
         super().__init__(model, masker, feature_names=feature_names, linearize_link=linearize_link)
 
+        # interpret.glassbox.ExplainableBoostingClassifier なら特別処理
         if safe_isinstance(model, "interpret.glassbox.ExplainableBoostingClassifier"):
+            # model.decision_function を実際の予測関数として使う
             self.model = model.decision_function
 
+            # マスカーが指定されていない場合は、まだ未実装とみなしてエラー
             if self.masker is None:
                 self._expected_value = model.intercept_
-                # num_features = len(model.additive_terms_)
-
-                # fm = MaskedModel(self.model, self.masker, self.link, np.zeros(num_features))
-                # masks = np.ones((1, num_features), dtype=bool)
-                # outputs = fm(masks)
-                # self.model(np.zeros(num_features))
-                # self._zero_offset = self.model(np.zeros(num_features))#model.intercept_#outputs[0]
-                # self._input_offsets = np.zeros(num_features) #* self._zero_offset
+                # ここ以下のコードはコメントアウトされているが、
+                # 本来は EBMから必要な情報を取得して _zero_offset 等を計算する想定と思われる
                 raise NotImplementedError(
                     "Masker not given and we don't yet support pulling the distribution centering directly from the EBM model!"
                 )
                 return
 
-        # here we need to compute the offsets ourselves because we can't pull them directly from a model we know about
+        # 相互作用がない加法的モデルを前提としているので、Tabular(Independent)なマスカーであることをチェック
         assert safe_isinstance(
             self.masker, "shap.maskers.Independent"
         ), "The Additive explainer only supports the Tabular masker at the moment!"
 
-        # pre-compute per-feature offsets
-        fm = MaskedModel(self.model, self.masker, self.link, self.linearize_link, np.zeros(self.masker.shape[1]))
+        # 以下、「ベースライン(_zero_offset)」と「各特徴量の単独オフセット(_input_offsets)」を計算
+        # まず MaskedModel を使って、一度に複数パターンのマスクを評価し、その出力差分を利用する
+        fm = MaskedModel(
+            self.model,              # モデル(EBMなど)
+            self.masker,             # Independentマスカー
+            self.link,               # リンク関数
+            self.linearize_link,     # リンク線形化の有無
+            np.zeros(self.masker.shape[1])  # 特徴量数だけ0で埋めた入力
+        )
+
+        # masks行列を作る: 行の次元 = (特徴量数 + 1)
+        #   最初の1行は 全てTrue (全特徴量ON)
+        #   2行目以降は特定の1特徴量だけFalse (OFF)
         masks = np.ones((self.masker.shape[1] + 1, self.masker.shape[1]), dtype=bool)
         for i in range(1, self.masker.shape[1] + 1):
             masks[i, i - 1] = False
+
+        # fm(masks) で、いくつかのマスクパターン(全ON + 各1特徴OFF)を一度にモデル評価
+        # outputs.shape は (特徴量数+1,) となる想定
         outputs = fm(masks)
+
+        # 全ON時の出力を _zero_offset とする
         self._zero_offset = outputs[0]
+
+        # 各特徴量の単独オフセットを格納する配列
         self._input_offsets = np.zeros(masker.shape[1])
         for i in range(1, self.masker.shape[1] + 1):
+            # 特徴量 i-1 だけ OFF にしたときの出力(outputs[i]) と 全ON時(outputs[0]) との差分
             self._input_offsets[i - 1] = outputs[i] - self._zero_offset
 
+        # expected_value = 全特徴オフセットの合計 + ベースライン
         self._expected_value = self._input_offsets.sum() + self._zero_offset
 
     def __call__(self, *args, max_evals=None, silent=False):
-        """Explains the output of model(*args), where args represents one or more parallel iterable args."""
-        # we entirely rely on the general call implementation, we override just to remove **kwargs
-        # from the function signature
+        """
+        モデルへの入力(*args) に対する SHAP 値計算を行うエントリポイント。
+        ここでは親クラス(Explainer) の __call__ をそのまま利用し、キーワード引数(**kwargs) を除去しているだけ。
+        """
         return super().__call__(*args, max_evals=max_evals, silent=silent)
 
     @staticmethod
     def supports_model_with_masker(model, masker):
-        """Determines if this explainer can handle the given model.
-
-        This is an abstract static method meant to be implemented by each subclass.
         """
+        与えられた model と masker が、この AdditiveExplainer で扱えるかどうかを返す静的メソッド。
+        """
+        # EBM クラス(ExlainableBoostingClassifier) かつ 相互作用(interactions)が 0 の場合のみ対応
         if safe_isinstance(model, "interpret.glassbox.ExplainableBoostingClassifier"):
             if model.interactions != 0:
                 raise NotImplementedError("Need to add support for interaction effects!")
@@ -88,102 +112,30 @@ class AdditiveExplainer(Explainer):
         return False
 
     def explain_row(self, *row_args, max_evals, main_effects, error_bounds, batch_size, outputs, silent):
-        """Explains a single row and returns the tuple (row_values, row_expected_values, row_mask_shapes)."""
+        """
+        単一のサンプル(row_args[0])に対して SHAP 値(=各特徴量の寄与)を計算し、辞書形式で返す。
+        """
         x = row_args[0]
+        # 1. inputs行列を対角に x[i] を配置し、それ以外は0にする。
+            #   => 「特定の特徴量 i だけ本来の値を使い、他は 0(=OFF)」という入力を複数行作るイメージ。
+            # x = [10, 5, 2]  の場合、以下のような inputs 行列ができる
+            #   [[10, 0, 0],
+            #    [0, 5, 0],
+            #    [0, 0, 2]]
         inputs = np.zeros((len(x), len(x)))
         for i in range(len(x)):
             inputs[i, i] = x[i]
 
+        # モデルにこれらの inputs を通し、_zero_offset や _input_offsets との比較で寄与度(phi)を計算
         phi = self.model(inputs) - self._zero_offset - self._input_offsets
 
+        print(f"phi: {phi}")
+
+        # SHAP では "values" が寄与度、"expected_values" がベースラインに相当
         return {
             "values": phi,
             "expected_values": self._expected_value,
             "mask_shapes": [a.shape for a in row_args],
-            "main_effects": phi,
+            "main_effects": phi,  # 今回は相互作用考慮なし => main_effects = phi と同じ
             "clustering": getattr(self.masker, "clustering", None),
         }
-
-
-# class AdditiveExplainer(Explainer):
-#     """ Computes SHAP values for generalized additive models.
-
-#     This assumes that the model only has first order effects. Extending this to
-#     2nd and third order effects is future work (if you apply this to those models right now
-#     you will get incorrect answers that fail additivity).
-
-#     Parameters
-#     ----------
-#     model : function or ExplainableBoostingRegressor
-#         User supplied additive model either as either a function or a model object.
-
-#     data : numpy.array, pandas.DataFrame
-#         The background dataset to use for computing conditional expectations.
-#     feature_perturbation : "interventional"
-#         Only the standard interventional SHAP values are supported by AdditiveExplainer right now.
-#     """
-
-#     def __init__(self, model, data, feature_perturbation="interventional"):
-#         if feature_perturbation != "interventional":
-#             raise Exception("Unsupported type of feature_perturbation provided: " + feature_perturbation)
-
-#         if safe_isinstance(model, "interpret.glassbox.ebm.ebm.ExplainableBoostingRegressor"):
-#             self.f = model.predict
-#         elif callable(model):
-#             self.f = model
-#         else:
-#             raise ValueError("The passed model must be a recognized object or a function!")
-
-#         # convert dataframes
-#         if isinstance(data, (pd.Series, pd.DataFrame)):
-#             data = data.values
-#         self.data = data
-
-#         # compute the expected value of the model output
-#         self.expected_value = self.f(data).mean()
-
-#         # pre-compute per-feature offsets
-#         tmp = np.zeros(data.shape)
-#         self._zero_offset = self.f(tmp).mean()
-#         self._feature_offset = np.zeros(data.shape[1])
-#         for i in range(data.shape[1]):
-#             tmp[:,i] = data[:,i]
-#             self._feature_offset[i] = self.f(tmp).mean() - self._zero_offset
-#             tmp[:,i] = 0
-
-
-#     def shap_values(self, X):
-#         """ Estimate the SHAP values for a set of samples.
-
-#         Parameters
-#         ----------
-#         X : numpy.array, pandas.DataFrame or scipy.csr_matrix
-#             A matrix of samples (# samples x # features) on which to explain the model's output.
-
-#         Returns
-#         -------
-#         For models with a single output this returns a matrix of SHAP values
-#         (# samples x # features). Each row sums to the difference between the model output for that
-#         sample and the expected value of the model output (which is stored as expected_value
-#         attribute of the explainer).
-#         """
-
-#         # convert dataframes
-#         if isinstance(X, (pd.Series, pd.DataFrame)):
-#             X = X.values
-
-#         # assert isinstance(X, np.ndarray), "Unknown instance type: " + str(type(X))
-#         assert len(X.shape) == 1 or len(X.shape) == 2, "Instance must have 1 or 2 dimensions!"
-
-#         # convert dataframes
-#         if isinstance(X, (pd.Series, pd.DataFrame)):
-#             X = X.values
-
-#         phi = np.zeros(X.shape)
-#         tmp = np.zeros(X.shape)
-#         for i in range(X.shape[1]):
-#             tmp[:,i] = X[:,i]
-#             phi[:,i] = self.f(tmp) - self._zero_offset - self._feature_offset[i]
-#             tmp[:,i] = 0
-
-#         return phi

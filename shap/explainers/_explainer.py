@@ -14,6 +14,19 @@ from ..utils import safe_isinstance, show_progress
 from ..utils._exceptions import InvalidAlgorithmError
 from ..utils.transformers import is_transformers_lm
 
+# example.py内で呼び出し
+# model = xgboost.XGBRegressor()
+# model.fit(X_train, y_train)
+# explainer = shap.Explainer(model)
+# shap_values = explainer(X_test)
+# shap_values have [.values, .base_values, .data]
+# .values = array([[-0.47621608,  0.00522793, -0.11823769, ..., -0.37759832],
+#                  [-0.5051474 ,  0.02292835, -0.11505361, ...,-0.22896677],
+#                   ...])
+# .base_values = array([2.0718894, 2.0718894, 2.0718894, ..., 2.0718894], dtype=float32)
+# .data = array([[1.6812, 25., 4.19220056, ..., -119.01],
+#                [2.5313, 30., 5.03938356, ..., -119.46],
+#                ...])
 
 class Explainer(Serializable):
     """Uses Shapley values to explain any machine learning model or python function.
@@ -179,6 +192,7 @@ class Explainer(Serializable):
                     model, self.masker
                 ):  # TODO: check for Partition?
                     algorithm = "tree"
+                #AdditiveExplainerを使うケース
                 elif explainers.AdditiveExplainer.supports_model_with_masker(model, self.masker):
                     algorithm = "additive"
 
@@ -255,7 +269,10 @@ class Explainer(Serializable):
                     linearize_link=linearize_link,
                     **kwargs,
                 )
+
+            # algorithm = additive の場合
             elif algorithm == "additive":
+                # 自身をAdditiveExplainerに設定
                 self.__class__ = explainers.AdditiveExplainer
                 explainers.AdditiveExplainer.__init__(
                     self,
@@ -291,7 +308,7 @@ class Explainer(Serializable):
             else:
                 raise InvalidAlgorithmError(f"Unknown algorithm type passed: {algorithm}!")
 
-    def __call__(
+    def __call__(  # out = Explanation(...) を返す関数
         self,
         *args,
         max_evals="auto",
@@ -302,21 +319,23 @@ class Explainer(Serializable):
         silent=False,
         **kwargs,
     ):
-        """Explains the output of model(*args), where args is a list of parallel iterable datasets.
+        """
+        Explains the output of model(*args), where args is a list of parallel iterable datasets.
 
         Note this default version could be an abstract method that is implemented by each algorithm-specific
         subclass of Explainer. Descriptions of each subclasses' __call__ arguments
         are available in their respective doc-strings.
         """
-        # if max_evals == "auto":
-        #     self._brute_force_fallback
 
+        # ---- 1) 計測開始 (計算時間を測る目的) ----
         start_time = time.time()
 
+        # ---- 2) 特殊な OutputComposite の場合、modelセッティングを行う (テキスト生成など)
         if issubclass(type(self.masker), maskers.OutputComposite) and len(args) == 2:
             self.masker.model = models.TextGeneration(target_sentences=args[1])
-            args = args[:1]
-        # parse our incoming arguments
+            args = args[:1]  # 一旦2つ目の引数を取り除く
+
+        # ---- 3) 引数の長さやFeature Namesの初期化処理 ----
         num_rows = None
         args = list(args)
         if self.feature_names is None:
@@ -325,44 +344,53 @@ class Explainer(Serializable):
             feature_names = copy.deepcopy(self.feature_names)
         else:
             feature_names = [copy.deepcopy(self.feature_names)]
+
+        # ---- 4) argsの各要素を適切に変換 (DataFrame→numpy, NLP Dataset→list など) ----
         for i in range(len(args)):
-            # try and see if we can get a length from any of the for our progress bar
+            # len(...) からnum_rowsを推定
             if num_rows is None:
                 try:
                     num_rows = len(args[i])
                 except Exception:
                     pass
 
-            # convert DataFrames to numpy arrays
+            # DataFrameの場合、カラム名を feature_names に設定し、valuesに変換
             if isinstance(args[i], pd.DataFrame):
                 feature_names[i] = list(args[i].columns)
                 args[i] = args[i].to_numpy()
 
-            # convert nlp Dataset objects to lists
+            # NLP Datasetの場合はテキスト列を抽出
             if safe_isinstance(args[i], "nlp.arrow_dataset.Dataset"):
                 args[i] = args[i]["text"]
             elif issubclass(type(args[i]), dict) and "text" in args[i]:
                 args[i] = args[i]["text"]
 
+        # ---- 5) バッチサイズのデフォルト設定 ----
         if batch_size == "auto":
             if hasattr(self.masker, "default_batch_size"):
                 batch_size = self.masker.default_batch_size
             else:
                 batch_size = 10
 
-        # loop over each sample, filling in the values array
+        # ---- 6) SHAP値や関連出力をため込むためのリストを用意 ----
         values = []
         output_indices = []
         expected_values = []
         mask_shapes = []
-        main_effects = []
+        main_effects_list = []
         hierarchical_values = []
         clustering = []
         output_names = []
         error_std = []
+
+        # マスカーが feature_names を動的に作る場合のための処理
         if callable(getattr(self.masker, "feature_names", None)):
             feature_names = [[] for _ in range(len(args))]
+
+        # ---- 7) 入力データを行ごと(サンプルごと)に取り出し、explain_rowで説明 ----
+        # show_progress(...) は進捗バー表示用
         for row_args in show_progress(zip(*args), num_rows, self.__class__.__name__ + " explainer", silent):
+            # row_args は 1サンプルぶんの入力(複数argsがある場合はタプル)
             row_result = self.explain_row(
                 *row_args,
                 max_evals=max_evals,
@@ -373,22 +401,33 @@ class Explainer(Serializable):
                 silent=silent,
                 **kwargs,
             )
+            # row_result には {"values":..., "expected_values":..., "mask_shapes":...} などが返る想定
+            # _additive.pyや_exact.pyなどの各クラスで実装されている
+            # _additive.pyの場合、        
+            # return {"values": phi, "expected_values": self._expected_value,
+            #         "mask_shapes": [a.shape for a in row_args], "main_effects": phi, 
+            #         "clustering": getattr(self.masker, "clustering", None)}
+            #      (phi = self.model(inputs) - self._zero_offset - self._input_offsets)
+
             values.append(row_result.get("values", None))
             output_indices.append(row_result.get("output_indices", None))
             expected_values.append(row_result.get("expected_values", None))
             mask_shapes.append(row_result["mask_shapes"])
-            main_effects.append(row_result.get("main_effects", None))
+            main_effects_list.append(row_result.get("main_effects", None))
             clustering.append(row_result.get("clustering", None))
             hierarchical_values.append(row_result.get("hierarchical_values", None))
+
             tmp = row_result.get("output_names", None)
             output_names.append(tmp(*row_args) if callable(tmp) else tmp)
             error_std.append(row_result.get("error_std", None))
+
+            # マスカーが feature_names を動的に返す場合はここで取得
             if callable(getattr(self.masker, "feature_names", None)):
                 row_feature_names = self.masker.feature_names(*row_args)
                 for i in range(len(row_args)):
                     feature_names[i].append(row_feature_names[i])
 
-        # split the values up according to each input
+        # ---- 8) 得られた values[] を引数ごとに分割し、(サンプル数, maskされたshape) の配列にまとめる ----
         arg_values = [[] for a in args]
         for i in range(len(values)):
             pos = 0
@@ -397,16 +436,15 @@ class Explainer(Serializable):
                 arg_values[j].append(values[i][pos : pos + mask_length])
                 pos += mask_length
 
-        # collapse the arrays as possible
+        # ---- 9) そのほかのリスト(ベースラインやmain_effectsなど)を形を整えてまとめる ----
         expected_values = pack_values(expected_values)
-        main_effects = pack_values(main_effects)
+        main_effects_list = pack_values(main_effects_list)
         output_indices = pack_values(output_indices)
-        main_effects = pack_values(main_effects)
         hierarchical_values = pack_values(hierarchical_values)
         error_std = pack_values(error_std)
         clustering = pack_values(clustering)
 
-        # getting output labels
+        # ---- 10) 出力名(output_names)を整形 (多クラスや複数出力を扱う場合) ----
         ragged_outputs = False
         if output_indices is not None:
             ragged_outputs = not all(len(x) == len(output_indices[0]) for x in output_indices)
@@ -433,21 +471,20 @@ class Explainer(Serializable):
             if np.all(sliced_labels[0, :] == sliced_labels):
                 sliced_labels = sliced_labels[0]
 
-        # allow the masker to transform the input data to better match the masking pattern
-        # (such as breaking text into token segments)
+        # ---- 11) masker に data_transform があれば、それでデータを最終整形 ----
         if hasattr(self.masker, "data_transform"):
             new_args = []
             for row_args in zip(*args):
                 new_args.append([pack_values(v) for v in self.masker.data_transform(*row_args)])
             args = list(zip(*new_args))
 
-        # build the explanation objects
+        # ---- 12) Explanationオブジェクトを組み立てて返す (引数ごとに一つずつ) ----
         out = []
         for j, data in enumerate(args):
-            # reshape the attribution values using the mask_shapes
+            # 12a) arg_values[j] の shape を整える
             tmp = []
             for i, v in enumerate(arg_values[j]):
-                if np.prod(mask_shapes[i][j]) != np.prod(v.shape):  # see if we have multiple outputs
+                if np.prod(mask_shapes[i][j]) != np.prod(v.shape):
                     tmp.append(v.reshape(*mask_shapes[i][j], -1))
                 else:
                     tmp.append(v.reshape(*mask_shapes[i][j]))
@@ -456,25 +493,25 @@ class Explainer(Serializable):
             if feature_names[j] is None:
                 feature_names[j] = ["Feature " + str(i) for i in range(data.shape[1])]
 
-            # build an explanation object for this input argument
+            # 12b) Explanation(...) を生成
             out.append(
                 Explanation(
-                    arg_values[j],
-                    expected_values,
-                    data,
+                    arg_values[j],           # SHAP値(サンプル数, 特徴量数, [出力次元...])に相当
+                    expected_values,         # ベースライン (サンプル数, [出力次元...])
+                    data,                    # 元の入力データ
                     feature_names=feature_names[j],
-                    main_effects=main_effects,
+                    main_effects=main_effects_list,
                     clustering=clustering,
                     hierarchical_values=hierarchical_values,
-                    output_names=sliced_labels,  # self.output_names
+                    output_names=sliced_labels,
                     error_std=error_std,
                     compute_time=time.time() - start_time,
-                    # output_shape=output_shape,
-                    # lower_bounds=v_min, upper_bounds=v_max
                 )
             )
-        return out[0] if len(out) == 1 else out
 
+        # 複数の引数がある場合は Explanation オブジェクトが複数出る。単一なら out[0]を返す
+        return out[0] if len(out) == 1 else out
+    
     def explain_row(self, *row_args, max_evals, main_effects, error_bounds, outputs, silent, **kwargs):
         """Explains a single row and returns the tuple (row_values, row_expected_values, row_mask_shapes, main_effects).
 

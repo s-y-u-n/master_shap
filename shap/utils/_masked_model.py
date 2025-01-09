@@ -20,21 +20,43 @@ class MaskedModel:
     delta_mask_noop_value = 2147483647  # used to encode a noop for delta masking
 
     def __init__(self, model, masker, link, linearize_link, *args):
+        """
+        model : callable or class
+            予測を行うモデル。通常は model(...) で 出力が得られる関数 or オブジェクト。
+
+        masker : object
+            特徴量をマスク（無効化）する仕組みを持つオブジェクト。たとえば
+            'shap.maskers.Independent' など。
+
+        link : リンク関数 (例: 恒等関数, ロジットなど)
+            SHAP 値を計算するときに、出力をどう変換するかを指定する関数。
+
+        linearize_link : bool
+            リンク関数を線形化してSHAP値を再重みづけするかどうかを指定。
+            (AdditiveExplainerなどが使う場合がある)
+
+        *args : Any
+            この MaskedModel が扱う "現在の入力サンプル"。複数の配列が渡されることがある。
+
+        """
         self.model = model
         self.masker = masker
         self.link = link
         self.linearize_link = linearize_link
         self.args = args
 
-        # if the masker supports it, save what positions vary from the background
+        # masker が invariants() メソッドを持つ場合、背景と変わらない部分(=固定)を把握しておく
         if callable(getattr(self.masker, "invariants", None)):
             self._variants = ~self.masker.invariants(*args)
+            # 各列について、どれだけ "可変" な行があるかを把握
             self._variants_column_sums = self._variants.sum(0)
+            # 行ごとに可変かどうか (列ごとにbool) をリスト化
             self._variants_row_inds = [self._variants[:, i] for i in range(self._variants.shape[1])]
         else:
             self._variants = None
 
-        # compute the length of the mask (and hence our length)
+        # masker.shape から、(行数, 列数)を取得する
+        #   例: Independent(masker) なら (dataの行数, dataの列数) など
         if hasattr(self.masker, "shape"):
             if callable(self.masker.shape):
                 mshape = self.masker.shape(*self.args)
@@ -45,31 +67,53 @@ class MaskedModel:
                 self._masker_rows = mshape[0]
                 self._masker_cols = mshape[1]
         else:
-            self._masker_rows = None  # # just assuming...
+            # shape 情報を持たない masker の場合、推定として
+            # "args の shape を全部足し合わせた列数" とみなす
+            self._masker_rows = None
             self._masker_cols = sum(np.prod(a.shape) for a in self.args)
 
         self._linearizing_weights = None
 
     def __call__(self, masks, zero_index=None, batch_size=None):
-        # if we are passed a 1D array of indexes then we are delta masking and have a special implementation
+        """
+        MaskedModel を関数呼び出しのように使えるようにし、
+        与えられた "masks" に応じてマスク処理を行い、モデルを評価して結果を返す。
+
+        masks : ndarray
+            (N, M) などの形で、N個のマスクパターン、Mは特徴量数
+            もしくは 1Dのマスク（delta masking）かもしれない。
+
+        zero_index : オプション
+            baselineのindexなどを示す際に使えるパラメータ (AdditiveExplainerなどで使用)
+
+        batch_size : int or None
+            大きいNをバッチ分割する際に指定。メモリ節約や速度最適化。
+        """
+        # delta masking という "差分マスク" の仕組みがあるときは、別のルートで処理
         if len(masks.shape) == 1:
             if getattr(self.masker, "supports_delta_masking", False):
                 return self._delta_masking_call(masks, zero_index=zero_index, batch_size=batch_size)
-
-            # we need to convert from delta masking to a full masking call because we were given a delta masking
-            # input but the masker does not support delta masking
             else:
+                # supports_delta_masking しないmaskerなら、deltaマスクを通常マスクに変換
                 full_masks = np.zeros((int(np.sum(masks >= 0)), self._masker_cols), dtype=bool)
                 _convert_delta_mask_to_full(masks, full_masks)
                 return self._full_masking_call(full_masks, zero_index=zero_index, batch_size=batch_size)
 
         else:
+            # 通常の (N, M) のboolマスクを扱う
             return self._full_masking_call(masks, batch_size=batch_size)
 
     def _full_masking_call(self, masks, zero_index=None, batch_size=None):
+        """
+        通常のboolマスク (N, M) を受け取り、その都度モデルに入力を作って評価し、結果を返す内部関数。
+        """
+        # バッチサイズが指定されていない場合は、マスク数分を1バッチとする
         if batch_size is None:
             batch_size = len(masks)
+        # マスクの差分をリセットするメソッドがあるかどうか
         do_delta_masking = getattr(self.masker, "reset_delta_masking", None) is not None
+        # 1) batchごとに分割しながら処理(大規模時のメモリ節約)
+        # 2) "可変行" をうまく判定して、モデル再評価を最小限にする
         num_varying_rows = np.zeros(len(masks), dtype=int)
         batch_positions = np.zeros(len(masks) + 1, dtype=int)
         varying_rows = []
@@ -165,31 +209,6 @@ class MaskedModel:
         )
 
         return averaged_outs
-
-        # return self._build_output(outputs, batch_positions, varying_rows)
-
-    # def _build_varying_delta_mask_rows(self, masks):
-    #     """ This builds the _varying_delta_mask_rows property which is a list of rows that
-    #     could change for each delta set.
-    #     """
-
-    #     self._varying_delta_mask_rows = []
-    #     i = -1
-    #     masks_pos = 0
-    #     while masks_pos < len(masks):
-    #         i += 1
-
-    #         delta_index = masks[masks_pos]
-    #         masks_pos += 1
-
-    #         # update the masked inputs
-    #         varying_rows_set = []
-    #         while delta_index < 0: # negative values mean keep going
-    #             original_index = -delta_index + 1
-    #             varying_rows_set.append(self._variants_row_inds[original_index])
-    #             delta_index = masks[masks_pos]
-    #             masks_pos += 1
-    #         self._varying_delta_mask_rows.append(np.unique(np.concatenate(varying_rows_set)))
 
     def _delta_masking_call(self, masks, zero_index=None, batch_size=None):
         # TODO: we need to do batching here

@@ -140,7 +140,8 @@ class TreeExplainer:
 
     def __init__(self, model, **kwargs):
         self.model_type = "internal"
-
+        
+        # モデルの種類を判定し、内部で統一的に扱える形式に変換
         if str(type(model)).endswith("sklearn.ensemble.forest.RandomForestRegressor'>"):
             self.trees = [Tree(e.tree_) for e in model.estimators_]
         elif str(type(model)).endswith("sklearn.ensemble.forest.RandomForestClassifier'>"):
@@ -154,6 +155,7 @@ class TreeExplainer:
         else:
             raise ExplainerError("Model type not supported by TreeExplainer: " + str(type(model)))
 
+        # 内部用のときに、パス拡張やウェイト計算用の配列をあらかじめ確保する
         if self.model_type == "internal":
             # Preallocate space for the unique path data
             maxd = np.max([t.max_depth for t in self.trees]) + 2

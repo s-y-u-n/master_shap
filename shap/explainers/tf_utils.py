@@ -2,14 +2,14 @@ import warnings
 
 tf = None
 
-
+# tensorflowのインポート
 def _import_tf():
     """Tries to import tensorflow."""
     global tf
     if tf is None:
         import tensorflow as tf
 
-
+# TensorFlow v1 系のセッション(tf.compat.v1.Session)を取得するためのユーティリティ関数
 def _get_session(session):
     """Common utility to get the session for the tensorflow-based explainer.
 
@@ -33,7 +33,7 @@ def _get_session(session):
             session = tf.keras.backend.get_session()
     return tf.get_default_session() if session is None else session
 
-
+# TensorFlow の計算グラフ（tf.Graph）を取得するためのヘルパー関数
 def _get_graph(explainer):
     """Common utility to get the graph for the tensorflow-based explainer.
 
@@ -53,7 +53,7 @@ def _get_graph(explainer):
         graph = backend.get_graph()
         return graph
 
-
+# モデルの入力とモデルの出力を統一的に取得するための関数
 def _get_model_inputs(model):
     """Common utility to determine the model inputs.
 
