@@ -37,31 +37,38 @@ log = logging.getLogger("shap")
 
 
 class KernelExplainer(Explainer):
+    def __init__(self, model, data, feature_names=None, link="identity", **kwargs):
     #   ユーザが与えた model や data をSHAP用の標準形式に変換し、背景データやリンク関数、モデルの期待値(ベースライン)などを初期化する。
     #   また、背景データが多い場合には警告を出す。
-    def __init__(self, model, data, feature_names=None, link="identity", **kwargs):
+        print("KernelExplainer.__init__")
         if feature_names is not None:
             self.data_feature_names = feature_names
         elif isinstance(data, pd.DataFrame):
             self.data_feature_names = list(data.columns)
 
-        # convert incoming inputs to standardized iml objects
+        # link, model, data を SHAP の標準化された形式に変換
+        print("link, model, data を SHAP の標準化された形式に変換")
         self.link = convert_to_link(link)
         self.keep_index = kwargs.get("keep_index", False)
         self.keep_index_ordered = kwargs.get("keep_index_ordered", False)
         self.model = convert_to_model(model, keep_index=self.keep_index)
         self.data = convert_to_data(data, keep_index=self.keep_index)
+
+        # モデルとデータの対応づけを行い、予測値などを取得
+        print("モデルとデータの対応づけを行い、予測値などを取得")
+        print("model = ", self.model)
         model_null = match_model_to_data(self.model, self.data)
 
-        # enforce our current input type limitations
+        # 現在サポートしているデータ形式かどうかをチェック (DenseData または SparseData のみ)
         if not isinstance(self.data, (DenseData, SparseData)):
             emsg = "Shap explainer only supports the DenseData and SparseData input currently."
             raise TypeError(emsg)
+        # 転置された形式は対応外としてエラーを出す
         if self.data.transposed:
             emsg = "Shap explainer does not support transposed DenseData or SparseData currently."
             raise DimensionError(emsg)
 
-        # warn users about large background data sets
+        # バックグラウンドデータが大きすぎる場合に警告 (高速性が失われる可能性がある)
         if len(self.data.weights) > 100:
             log.warning(
                 "Using "
@@ -118,16 +125,20 @@ class KernelExplainer(Explainer):
     # ユーザが説明を求めるサンプル群 X に対して、実際に shap_values を計算し、Explanation オブジェクトとして返す。
     # どの行(サンプル)も同じ「期待値」を持つようにタイル処理し、出力をまとめる。
     def __call__(self, X, l1_reg="num_features(10)", silent=False):
+        print("KernelExplainer.__call__")
         start_time = time.time()
 
         if isinstance(X, pd.DataFrame):
             feature_names = list(X.columns)
         else:
             feature_names = getattr(self, "data_feature_names", None)
+        print("feature_names = ", feature_names)
 
+        # shap_values メソッドを呼び出して SHAP 値を計算
         v = self.shap_values(X, l1_reg=l1_reg, silent=silent)
         if isinstance(v, list):
             v = np.stack(v, axis=-1)  # put outputs at the end
+        print("v = ", v)
 
         # the explanation object expects an expected value for each row
         if hasattr(self.expected_value, "__len__"):
@@ -152,6 +163,7 @@ class KernelExplainer(Explainer):
         X: Union[np.ndarray, pd.DataFrame, scipy.sparse.spmatrix],
         **kwargs
     ) -> Union[np.ndarray, List[np.ndarray]]:
+        print("KernelExplainer.shap_values")
         
         # convert dataframes
         if isinstance(X, pd.Series):
@@ -169,9 +181,11 @@ class KernelExplainer(Explainer):
         if scipy.sparse.issparse(X) and not scipy.sparse.isspmatrix_lil(X):
             X = X.tolil()
         assert x_type.endswith(arr_type) or scipy.sparse.isspmatrix_lil(X), "Unknown instance type: " + x_type
+        print("X = ", X)
 
         # single instance
         if len(X.shape) == 1:
+            #   単一サンプルの場合は explain メソッドを1回呼び出して結果を返却。
             data = X.reshape((1, X.shape[0]))
             if self.keep_index:
                 data = convert_to_instance_with_index(data, column_name, index_name, index_value)
@@ -185,11 +199,15 @@ class KernelExplainer(Explainer):
 
         # explain the whole dataset
         elif len(X.shape) == 2:
+            #   複数サンプルの場合は各サンプルごとに explain を呼び出し、その結果をまとめて返す。
             explanations = []
             for i in tqdm(range(X.shape[0]), disable=kwargs.get("silent", False)):
                 data = X[i : i + 1, :]
                 if self.keep_index:
                     data = convert_to_instance_with_index(data, column_name, index_value[i : i + 1], index_name)
+                print("data = ", data)
+                # SHAP値を計算するメソッド
+                # explain呼び出し
                 explanations.append(self.explain(data, **kwargs))
                 if kwargs.get("gc_collect", False):
                     gc.collect()
@@ -210,6 +228,7 @@ class KernelExplainer(Explainer):
                 for i in range(X.shape[0]):
                     out[i] = explanations[i]
                 return out
+            print("out = ", out)
 
         else:
             emsg = "Instance must have 1 or 2 dimensions!"
@@ -222,75 +241,86 @@ class KernelExplainer(Explainer):
     #       変動が1つのみ: その1つに全寄与を割り当てる
     #       複数: Kernel SHAP のサンプリング手法によりShapley値を近似計算
     #   計算には allocate → addsample → run → solve といった一連のメソッドを呼び出して進める。
+        print("KernelExplainer.explain")
         
-        # convert incoming input to a standardized iml object
+        # インスタンスを SHAP の標準化されたオブジェクトに変換
         instance = convert_to_instance(incoming_instance)
+        # 入力インスタンスと背景データの整合性をチェック
         match_instance_to_data(instance, self.data)
+        print("instance = ", instance)
 
-        # find the feature groups we will test. If a feature does not change from its
-        # current value then we know it doesn't impact the model
-        self.varyingInds = self.varying_groups(instance.x)
+        # 現在のサンプル x と、背景データの値が異なる（実際に変動し得る）特徴量を特定
+        self.varyingInds = self.varying_groups(instance.x) 
         if self.data.groups is None:
+            # グループ指定がなければ、そのままインデックスを配列として保持
             self.varyingFeatureGroups = np.array([i for i in self.varyingInds])
             self.M = self.varyingFeatureGroups.shape[0]
         else:
+            # グループ指定がある場合は、そのグループIDを取得
             self.varyingFeatureGroups = [self.data.groups[i] for i in self.varyingInds]
             self.M = len(self.varyingFeatureGroups)
             groups = self.data.groups
-            # convert to numpy array as it is much faster if not jagged array (all groups of same length)
-            if self.varyingFeatureGroups and all(len(groups[i]) == len(groups[0]) for i in self.varyingInds):
+            # ジャギー配列でない場合は numpy 配列化して高速化
+            if (
+                self.varyingFeatureGroups and
+                all(len(groups[i]) == len(groups[0]) for i in self.varyingInds)
+            ):
                 self.varyingFeatureGroups = np.array(self.varyingFeatureGroups)
-                # further performance optimization in case each group has a single value
+                # もし各グループが要素1つだけなら、フラットな配列に変換
                 if self.varyingFeatureGroups.shape[1] == 1:
                     self.varyingFeatureGroups = self.varyingFeatureGroups.flatten()
 
-        # find f(x)
+        # f(x) を計算 (現在のサンプルをモデルに入力し、出力を取得)
         if self.keep_index:
             model_out = self.model.f(instance.convert_to_df())
         else:
             model_out = self.model.f(instance.x)
+        # 出力が DataFrame や Series、あるいは TensorFlow シンボリックテンソルの可能性を考慮
         if isinstance(model_out, (pd.DataFrame, pd.Series)):
             model_out = model_out.values
         elif safe_isinstance(model_out, "tensorflow.python.framework.ops.SymbolicTensor"):
             model_out = self._convert_symbolic_tensor(model_out)
-        self.fx = model_out[0]
+        self.fx = model_out[0]  # 現在のサンプルにおけるモデル出力 (マルチ出力なら先頭要素のみ)
+        print("self.fx = ", self.fx)
 
+        # 出力がベクトル（マルチ出力）かどうかを確認
         if not self.vector_out:
             self.fx = np.array([self.fx])
 
-        # if no features vary then no feature has an effect
+        # 変動する特徴量がひとつもない場合 (背景データと同一で違いが無い)
         if self.M == 0:
             phi = np.zeros((self.data.groups_size, self.D))
             phi_var = np.zeros((self.data.groups_size, self.D))
 
-        # if only one feature varies then it has all the effect
+        # 変動する特徴量が1つだけなら、その1つがすべての差分を担う
         elif self.M == 1:
             phi = np.zeros((self.data.groups_size, self.D))
             phi_var = np.zeros((self.data.groups_size, self.D))
+            # fx と fnull の差分 (link関数を通して) がそのまま SHAP 値
             diff = self.link.f(self.fx) - self.link.f(self.fnull)
             for d in range(self.D):
                 phi[self.varyingInds[0], d] = diff[d]
 
-        # if more than one feature varies then we have to do real work
+        # 変動する特徴量が2つ以上ある場合は、サンプリングを使った Kernel SHAP を実行
+        # 実計算箇所
         else:
             self.l1_reg = kwargs.get("l1_reg", "num_features(10)")
-
-            # pick a reasonable number of samples if the user didn't specify how many they wanted
+            # サンプリング数 nsamples が指定されていなければ自動で設定
             self.nsamples = kwargs.get("nsamples", "auto")
             if self.nsamples == "auto":
                 self.nsamples = 2 * self.M + 2**11
 
-            # if we have enough samples to enumerate all subsets then ignore the unneeded samples
+            # もし M <= 30 なら、2^M-2 が全列挙に必要な最大サンプリング数
             self.max_samples = 2**30
             if self.M <= 30:
                 self.max_samples = 2**self.M - 2
                 if self.nsamples > self.max_samples:
                     self.nsamples = self.max_samples
 
-            # reserve space for some of our computations
+            # SHAP の計算に必要な領域を確保
             self.allocate()
 
-            # weight the different subset sizes
+            # サブセットサイズに応じた重みの計算や、全列挙が可能なサブセットの探索
             num_subset_sizes = int(np.ceil((self.M - 1) / 2.0))
             num_paired_subset_sizes = int(np.floor((self.M - 1) / 2.0))
             weight_vector = np.array([(self.M - 1.0) / (i * (self.M - i)) for i in range(1, num_subset_sizes + 1)])
@@ -301,15 +331,14 @@ class KernelExplainer(Explainer):
             log.debug(f"{num_paired_subset_sizes = }")
             log.debug(f"{self.M = }")
 
-            # fill out all the subset sizes we can completely enumerate
-            # given nsamples*remaining_weight_vector[subset_size]
+            # 重みが対応するサブセットサイズ分を全列挙 (必要なら)
             num_full_subsets = 0
             num_samples_left = self.nsamples
             group_inds = np.arange(self.M, dtype="int64")
             mask = np.zeros(self.M)
             remaining_weight_vector = copy.copy(weight_vector)
             for subset_size in range(1, num_subset_sizes + 1):
-                # determine how many subsets (and their complements) are of the current size
+                # subset_size の組み合わせ数 (必要なら complement を含めて2倍)
                 nsubsets = binom(self.M, subset_size)
                 if subset_size <= num_paired_subset_sizes:
                     nsubsets *= 2
@@ -324,16 +353,16 @@ class KernelExplainer(Explainer):
                     f"{num_samples_left * remaining_weight_vector[subset_size - 1] / nsubsets}"
                 )
 
-                # see if we have enough samples to enumerate all subsets of this size
+                # もし十分なサンプリング数があれば、subset_size のすべてを全列挙
                 if num_samples_left * remaining_weight_vector[subset_size - 1] / nsubsets >= 1.0 - 1e-8:
                     num_full_subsets += 1
                     num_samples_left -= nsubsets
 
-                    # rescale what's left of the remaining weight vector to sum to 1
+                    # 使い切った重みに合わせて、残りの重みを正規化
                     if remaining_weight_vector[subset_size - 1] < 1.0:
                         remaining_weight_vector /= 1 - remaining_weight_vector[subset_size - 1]
 
-                    # add all the samples of the current subset size
+                    # subset_size の組み合わせをすべて addsample() により追加
                     w = weight_vector[subset_size - 1] / binom(self.M, subset_size)
                     if subset_size <= num_paired_subset_sizes:
                         w /= 2.0
@@ -342,35 +371,42 @@ class KernelExplainer(Explainer):
                         mask[np.array(inds, dtype="int64")] = 1.0
                         self.addsample(instance.x, mask, w)
                         if subset_size <= num_paired_subset_sizes:
+                            # subset の補集合も追加
                             mask[:] = np.abs(mask - 1)
                             self.addsample(instance.x, mask, w)
                 else:
                     break
             log.info(f"{num_full_subsets = }")
 
-            # add random samples from what is left of the subset space
+            # 全列挙できなかった部分はランダムにサンプリングしてカバー
             nfixed_samples = self.nsamplesAdded
             samples_left = self.nsamples - self.nsamplesAdded
             log.debug(f"{samples_left = }")
             if num_full_subsets != num_subset_sizes:
                 remaining_weight_vector = copy.copy(weight_vector)
-                remaining_weight_vector[:num_paired_subset_sizes] /= 2  # because we draw two samples each below
+                # サブセットと補集合を同時にサンプリングするために半分にする
+                remaining_weight_vector[:num_paired_subset_sizes] /= 2
                 remaining_weight_vector = remaining_weight_vector[num_full_subsets:]
                 remaining_weight_vector /= np.sum(remaining_weight_vector)
                 log.info(f"{remaining_weight_vector = }")
                 log.info(f"{num_paired_subset_sizes = }")
-                ind_set = np.random.choice(len(remaining_weight_vector), 4 * samples_left, p=remaining_weight_vector)
+
+                # まとめてサブセットサイズを抽選し、その後で各サンプルを生成
+                ind_set = np.random.choice(
+                    len(remaining_weight_vector),
+                    4 * samples_left,
+                    p=remaining_weight_vector
+                )
                 ind_set_pos = 0
                 used_masks = {}
                 while samples_left > 0 and ind_set_pos < len(ind_set):
                     mask.fill(0.0)
-                    ind = ind_set[ind_set_pos]  # we call np.random.choice once to save time and then just read it here
+                    ind = ind_set[ind_set_pos]
                     ind_set_pos += 1
                     subset_size = ind + num_full_subsets + 1
                     mask[np.random.permutation(self.M)[:subset_size]] = 1.0
 
-                    # only add the sample if we have not seen it before, otherwise just
-                    # increment a previous sample's weight
+                    # マスクが初めて出てきた組み合わせなら新規登録、重複ならそのサンプルの重みを加算
                     mask_tuple = tuple(mask)
                     new_sample = False
                     if mask_tuple not in used_masks:
@@ -381,29 +417,26 @@ class KernelExplainer(Explainer):
                     else:
                         self.kernelWeights[used_masks[mask_tuple]] += 1.0
 
-                    # add the compliment sample
+                    # サブセットの補集合についても同様に処理
                     if samples_left > 0 and subset_size <= num_paired_subset_sizes:
                         mask[:] = np.abs(mask - 1)
-
-                        # only add the sample if we have not seen it before, otherwise just
-                        # increment a previous sample's weight
                         if new_sample:
                             samples_left -= 1
                             self.addsample(instance.x, mask, 1.0)
                         else:
-                            # we know the compliment sample is the next one after the original sample, so + 1
+                            # 補集合は同じ順序で次のサンプルになるので +1
                             self.kernelWeights[used_masks[mask_tuple] + 1] += 1.0
 
-                # normalize the kernel weights for the random samples to equal the weight left after
-                # the fixed enumerated samples have been already counted
+                # ランダムサンプリングした部分について kernelWeights を正規化
                 weight_left = np.sum(weight_vector[num_full_subsets:])
                 log.info(f"{weight_left = }")
                 self.kernelWeights[nfixed_samples:] *= weight_left / self.kernelWeights[nfixed_samples:].sum()
+                print("self.kernelWeights = ", self.kernelWeights)
 
-            # execute the model on the synthetic samples we have created
+            # これまでに生成したサンプルをモデルに入力して予測値を得る
             self.run()
 
-            # solve then expand the feature importance (Shapley value) vector to contain the non-varying features
+            # 回帰により得た部分結果を、変動しない特徴量も含めたフルサイズ (self.data.groups_size) に拡張
             phi = np.zeros((self.data.groups_size, self.D))
             phi_var = np.zeros((self.data.groups_size, self.D))
             for d in range(self.D):
@@ -411,12 +444,15 @@ class KernelExplainer(Explainer):
                 phi[self.varyingInds, d] = vphi
                 phi_var[self.varyingInds, d] = vphi_var
 
+        # single-output の場合は squeeze
         if not self.vector_out:
             phi = np.squeeze(phi, axis=1)
             phi_var = np.squeeze(phi_var, axis=1)
 
+        # SHAP 値( phi )を返す
+        print("phi = ", phi)
         return phi
-
+    
     @staticmethod
     def not_equal(i, j):
     #   2つの要素が「実質的に等しいかどうか」を判定するヘルパー関数。
@@ -543,6 +579,7 @@ class KernelExplainer(Explainer):
     def run(self):
     #   これまでに追加された合成サンプルを実際にモデルに入力し、モデルの出力を得る。
     #   モデル出力を self.y に格納し、さらに各サンプルの期待値(バックグラウンド重み付き平均)を計算して self.ey に保存する。
+        print("KernelExplainer.run")
         num_to_run = self.nsamplesAdded * self.N - self.nsamplesRun * self.N
         data = self.synth_data[self.nsamplesRun * self.N : self.nsamplesAdded * self.N, :]
         if self.keep_index:
@@ -568,6 +605,9 @@ class KernelExplainer(Explainer):
 
             self.ey[i, :] = eyVal
             self.nsamplesRun += 1
+        
+        #print("self.y = ", self.y)
+        #print("self.ey = ", self.ey)
 
     def solve(self, fraction_evaluated, dim):
     #   サンプリングした合成サンプルの結果(y, eyなど)を用いて、重み付き線形回帰を解き、各特徴量(グループ)のShapley値を推定するメソッド。
