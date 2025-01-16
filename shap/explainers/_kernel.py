@@ -15,6 +15,7 @@ from sklearn.linear_model import Lasso, LassoLarsIC, lars_path
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
+from typing import Union, List
 
 from .._explanation import Explanation
 from ..utils import safe_isinstance
@@ -36,51 +37,8 @@ log = logging.getLogger("shap")
 
 
 class KernelExplainer(Explainer):
-    """Uses the Kernel SHAP method to explain the output of any function.
-
-    Kernel SHAP is a method that uses a special weighted linear regression
-    to compute the importance of each feature. The computed importance values
-    are Shapley values from game theory and also coefficients from a local linear
-    regression.
-
-    Parameters
-    ----------
-    model : function or iml.Model
-        User supplied function that takes a matrix of samples (# samples x # features) and
-        computes the output of the model for those samples. The output can be a vector
-        (# samples) or a matrix (# samples x # model outputs).
-
-    data : numpy.array or pandas.DataFrame or shap.common.DenseData or any scipy.sparse matrix
-        The background dataset to use for integrating out features. To determine the impact
-        of a feature, that feature is set to "missing" and the change in the model output
-        is observed. Since most models aren't designed to handle arbitrary missing data at test
-        time, we simulate "missing" by replacing the feature with the values it takes in the
-        background dataset. So if the background dataset is a simple sample of all zeros, then
-        we would approximate a feature being missing by setting it to zero. For small problems,
-        this background dataset can be the whole training set, but for larger problems consider
-        using a single reference value or using the ``kmeans`` function to summarize the dataset.
-        Note: for the sparse case, we accept any sparse matrix but convert to lil format for
-        performance.
-
-    feature_names : list
-        The names of the features in the background dataset. If the background dataset is
-        supplied as a pandas.DataFrame, then ``feature_names`` can be set to ``None`` (default),
-        and the feature names will be taken as the column names of the dataframe.
-
-    link : "identity" or "logit"
-        A generalized linear model link to connect the feature importance values to the model
-        output. Since the feature importance values, phi, sum up to the model output, it often makes
-        sense to connect them to the output with a link function where link(output) = sum(phi).
-        Default is "identity" (a no-op).
-        If the model output is a probability, then "logit" can be used to transform the SHAP values
-        into log-odds units.
-
-    Examples
-    --------
-    See :ref:`Kernel Explainer Examples <kernel_explainer_examples>`.
-
-    """
-
+    #   ユーザが与えた model や data をSHAP用の標準形式に変換し、背景データやリンク関数、モデルの期待値(ベースライン)などを初期化する。
+    #   また、背景データが多い場合には警告を出す。
     def __init__(self, model, data, feature_names=None, link="identity", **kwargs):
         if feature_names is not None:
             self.data_feature_names = feature_names
@@ -141,6 +99,8 @@ class KernelExplainer(Explainer):
             self.D = self.fnull.shape[0]
 
     @staticmethod
+    # symbolic_tensor が tensorflow の tensor である場合、numpy の ndarray に変換する。
+    # tf.Session() (あるいは tf.compat.v1.Session()) を用いてテンソルを実際の値に変換する。
     def _convert_symbolic_tensor(symbolic_tensor) -> np.ndarray:
         import tensorflow as tf
 
@@ -155,6 +115,8 @@ class KernelExplainer(Explainer):
                 tensor_as_np_array = sess.run(symbolic_tensor)
         return tensor_as_np_array
 
+    # ユーザが説明を求めるサンプル群 X に対して、実際に shap_values を計算し、Explanation オブジェクトとして返す。
+    # どの行(サンプル)も同じ「期待値」を持つようにタイル処理し、出力をまとめる。
     def __call__(self, X, l1_reg="num_features(10)", silent=False):
         start_time = time.time()
 
@@ -181,59 +143,16 @@ class KernelExplainer(Explainer):
             compute_time=time.time() - start_time,
         )
 
-    def shap_values(self, X, **kwargs):
-        """Estimate the SHAP values for a set of samples.
-
-        Parameters
-        ----------
-        X : numpy.array or pandas.DataFrame or any scipy.sparse matrix
-            A matrix of samples (# samples x # features) on which to explain the model's output.
-
-        nsamples : "auto" or int
-            Number of times to re-evaluate the model when explaining each prediction. More samples
-            lead to lower variance estimates of the SHAP values. The "auto" setting uses
-            `nsamples = 2 * X.shape[1] + 2048`.
-
-        l1_reg : "num_features(int)", "aic", "bic", or float
-            The l1 regularization to use for feature selection. The estimation
-            procedure is based on a debiased lasso.
-
-            * "num_features(int)" selects a fixed number of top features.
-            * "aic" and "bic" options use the AIC and BIC rules for regularization.
-            * Passing a float directly sets the "alpha" parameter of the
-              ``sklearn.linear_model.Lasso`` model used for feature selection.
-            * "auto" (deprecated): uses "aic" when less than
-              20% of the possible sample space is enumerated, otherwise it uses
-              no regularization.
-
-            .. versionchanged:: 0.47.0
-                The default value changed from ``"auto"`` to ``"num_features(10)"``.
-
-        silent: bool
-            If True, hide tqdm progress bar. Default False.
-
-        gc_collect : bool
-           Run garbage collection after each explanation round. Sometime needed for memory intensive explanations (default False).
-
-        Returns
-        -------
-        np.array or list
-            Estimated SHAP values, usually of shape ``(# samples x # features)``.
-
-            Each row sums to the difference between the model output for that
-            sample and the expected value of the model output (which is stored as the ``expected_value``
-            attribute of the explainer).
-
-            The type and shape of the return value depends on the number of model inputs and outputs:
-
-            * one input, one output: array of shape ``(#num_samples, *X.shape[1:])``.
-            * one input, multiple outputs: array of shape ``(#num_samples, *X.shape[1:], #num_outputs)``
-            * multiple inputs: list of arrays of corresponding shape above.
-
-            .. versionchanged:: 0.45.0
-                Return type for models with multiple outputs and one input changed from list to np.ndarray.
-
-        """
+    #   ユーザが指定したサンプル(1件または複数件)に対して、SHAP値を計算するメソッド。
+    #   単一サンプルの場合は explain メソッドを1回呼び出して結果を返却。
+    #   複数サンプルの場合は各サンプルごとに explain を呼び出し、その結果をまとめて返す。
+    #   マルチ出力のときは次元整形を行い、出力形状を揃える。
+    def shap_values(
+        self,
+        X: Union[np.ndarray, pd.DataFrame, scipy.sparse.spmatrix],
+        **kwargs
+    ) -> Union[np.ndarray, List[np.ndarray]]:
+        
         # convert dataframes
         if isinstance(X, pd.Series):
             X = X.values
@@ -297,6 +216,13 @@ class KernelExplainer(Explainer):
             raise DimensionError(emsg)
 
     def explain(self, incoming_instance, **kwargs):
+    #   指定された単一インスタンス（サンプル）に対して、実際にSHAP値を推定するロジックを内包する。
+    #   「変動する特徴量(グループ)」がいくつあるかを調べ、
+    #       変動なし: すべて 0
+    #       変動が1つのみ: その1つに全寄与を割り当てる
+    #       複数: Kernel SHAP のサンプリング手法によりShapley値を近似計算
+    #   計算には allocate → addsample → run → solve といった一連のメソッドを呼び出して進める。
+        
         # convert incoming input to a standardized iml object
         instance = convert_to_instance(incoming_instance)
         match_instance_to_data(instance, self.data)
@@ -493,6 +419,8 @@ class KernelExplainer(Explainer):
 
     @staticmethod
     def not_equal(i, j):
+    #   2つの要素が「実質的に等しいかどうか」を判定するヘルパー関数。
+	#   数値型なら np.isclose で、その他型なら直接 == で比較し、一致しなければ 1、そうでなければ 0 を返す。
         number_types = (int, float, np.number)
         if isinstance(i, number_types) and isinstance(j, number_types):
             return 0 if np.isclose(i, j, equal_nan=True) else 1
@@ -500,6 +428,9 @@ class KernelExplainer(Explainer):
             return 0 if i == j else 1
 
     def varying_groups(self, x):
+    #   入力サンプル x と背景データを比較し、「背景データと異なる値を取る特徴量(グループ)」のインデックスを見つける。
+    #   背景データが sparse な場合、特徴量が 0 である場合は「変動なし」として 0 を返す。
+    #   疎行列・密行列の両方に対応し、不一致があるかどうかで変動する特徴量を特定する。
         if not scipy.sparse.issparse(x):
             varying = np.zeros(self.data.groups_size)
             for i in range(self.data.groups_size):
@@ -542,6 +473,8 @@ class KernelExplainer(Explainer):
             return varying_indices
 
     def allocate(self):
+    #   サンプリングによって生成する合成データ( synth_data )や、マスク行列( maskMatrix ), カーネル重み( kernelWeights ), モデル出力格納用( y / ey )などを初期化・確保する。
+    #   背景データが疎行列の場合と密行列の場合で処理を分け、性能を最適化している。
         if scipy.sparse.issparse(self.data.data):
             # We tile the sparse matrix in csr format but convert it to lil
             # for performance when adding samples
@@ -580,6 +513,8 @@ class KernelExplainer(Explainer):
             self.synth_data_index = np.tile(self.data.index_value, self.nsamples)
 
     def addsample(self, x, m, w):
+    #	あるサブセットを表すマスクベクトル m に基づいて合成データを作成する。
+    #   x の対応する特徴量だけを背景データ上書きして合成サンプルを生成し、マスク行列やカーネル重みも合わせて保存する。
         offset = self.nsamplesAdded * self.N
         if isinstance(self.varyingFeatureGroups, (list,)):
             for j in range(self.M):
@@ -606,6 +541,8 @@ class KernelExplainer(Explainer):
         self.nsamplesAdded += 1
 
     def run(self):
+    #   これまでに追加された合成サンプルを実際にモデルに入力し、モデルの出力を得る。
+    #   モデル出力を self.y に格納し、さらに各サンプルの期待値(バックグラウンド重み付き平均)を計算して self.ey に保存する。
         num_to_run = self.nsamplesAdded * self.N - self.nsamplesRun * self.N
         data = self.synth_data[self.nsamplesRun * self.N : self.nsamplesAdded * self.N, :]
         if self.keep_index:
@@ -633,6 +570,9 @@ class KernelExplainer(Explainer):
             self.nsamplesRun += 1
 
     def solve(self, fraction_evaluated, dim):
+    #   サンプリングした合成サンプルの結果(y, eyなど)を用いて、重み付き線形回帰を解き、各特徴量(グループ)のShapley値を推定するメソッド。
+    #   必要に応じてL1正則化(Lasso)やAIC/BIC基準などの手法で特徴選択を行う。
+    #   出力合計が (link.f(self.fx) - link.f(self.fnull)) になるように調整したベクトルをSHAP値( phi )として返す。
         eyAdj = self.linkfv(self.ey[:, dim]) - self.link.f(self.fnull[dim])
         s = np.sum(self.maskMatrix, 1)
 
