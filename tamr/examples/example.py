@@ -15,10 +15,8 @@ model = xgboost.XGBRegressor()
 model.fit(X_train, y_train)
 
 # SHAP値の計算
-explainer = shap.Explainer(model)
+explainer = shap.Explainer(model.predict, X_test)
 shap_values = explainer(X_test)
-
-print(model)
 
 # shap_values have [.values, .base_values, .data]
 # .values = array([[-0.47621608,  0.00522793, -0.11823769, ..., -0.37759832],
@@ -29,7 +27,8 @@ print(model)
 #                [2.5313, 30., 5.03938356, ..., -119.46],
 #                ...])
 
-"""
+
 # SHAP値のプロット
-shap.summary_plot(shap_values, X_test, feature_names=california.feature_names)
-"""
+#shap.summary_plot(shap_values, X_test, feature_names=california.feature_names)
+shap.waterfall_plot(shap_values[0])
+print(shap_values[0])
