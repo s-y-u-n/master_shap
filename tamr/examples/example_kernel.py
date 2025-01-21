@@ -1,5 +1,6 @@
 import sys
-sys.path.append('/Users/tamurashuntarou/CML/code/master_shap')
+#sys.path.append('/Users/tamurashuntarou/CML/code/master_shap')
+sys.path.append('/Users/tamr/CMIS/code/master_shap/shap')
 import shap
 import xgboost
 from sklearn.model_selection import train_test_split
