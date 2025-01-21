@@ -40,6 +40,7 @@ class KernelExplainer(Explainer):
     def __init__(self, model, data, feature_names=None, link="identity", **kwargs):
     #   ユーザが与えた model や data をSHAP用の標準形式に変換し、背景データやリンク関数、モデルの期待値(ベースライン)などを初期化する。
     #   また、背景データが多い場合には警告を出す。
+    # data = background data
         print("KernelExplainer.__init__")
         if feature_names is not None:
             self.data_feature_names = feature_names
@@ -47,7 +48,6 @@ class KernelExplainer(Explainer):
             self.data_feature_names = list(data.columns)
 
         # link, model, data を SHAP の標準化された形式に変換
-        print("link, model, data を SHAP の標準化された形式に変換")
         self.link = convert_to_link(link)
         self.keep_index = kwargs.get("keep_index", False)
         self.keep_index_ordered = kwargs.get("keep_index_ordered", False)
@@ -55,8 +55,6 @@ class KernelExplainer(Explainer):
         self.data = convert_to_data(data, keep_index=self.keep_index)
 
         # モデルとデータの対応づけを行い、予測値などを取得
-        print("モデルとデータの対応づけを行い、予測値などを取得")
-        print("model = ", self.model)
         model_null = match_model_to_data(self.model, self.data)
 
         # 現在サポートしているデータ形式かどうかをチェック (DenseData または SparseData のみ)
@@ -132,13 +130,11 @@ class KernelExplainer(Explainer):
             feature_names = list(X.columns)
         else:
             feature_names = getattr(self, "data_feature_names", None)
-        print("feature_names = ", feature_names)
 
         # shap_values メソッドを呼び出して SHAP 値を計算
         v = self.shap_values(X, l1_reg=l1_reg, silent=silent)
         if isinstance(v, list):
             v = np.stack(v, axis=-1)  # put outputs at the end
-        print("v = ", v)
 
         # the explanation object expects an expected value for each row
         if hasattr(self.expected_value, "__len__"):
@@ -163,8 +159,8 @@ class KernelExplainer(Explainer):
         X: Union[np.ndarray, pd.DataFrame, scipy.sparse.spmatrix],
         **kwargs
     ) -> Union[np.ndarray, List[np.ndarray]]:
-        print("KernelExplainer.shap_values")
-        
+        print(" KernelExplainer.shap_values")
+
         # convert dataframes
         if isinstance(X, pd.Series):
             X = X.values
@@ -181,7 +177,6 @@ class KernelExplainer(Explainer):
         if scipy.sparse.issparse(X) and not scipy.sparse.isspmatrix_lil(X):
             X = X.tolil()
         assert x_type.endswith(arr_type) or scipy.sparse.isspmatrix_lil(X), "Unknown instance type: " + x_type
-        print("X = ", X)
 
         # single instance
         if len(X.shape) == 1:
@@ -198,14 +193,17 @@ class KernelExplainer(Explainer):
             return out
 
         # explain the whole dataset
+        # X.shape[0] = (サンプル数, 特徴量数)
         elif len(X.shape) == 2:
             #   複数サンプルの場合は各サンプルごとに explain を呼び出し、その結果をまとめて返す。
             explanations = []
-            for i in tqdm(range(X.shape[0]), disable=kwargs.get("silent", False)):
+            # tqdmを使う場合
+            # for i in tqdm(range(X.shape[0]), disable=kwargs.get("silent", False)):
+            # tqdmを使わない場合
+            for i in range(X.shape[0]):
                 data = X[i : i + 1, :]
                 if self.keep_index:
                     data = convert_to_instance_with_index(data, column_name, index_value[i : i + 1], index_name)
-                print("data = ", data)
                 # SHAP値を計算するメソッド
                 # explain呼び出し
                 explanations.append(self.explain(data, **kwargs))
@@ -228,7 +226,6 @@ class KernelExplainer(Explainer):
                 for i in range(X.shape[0]):
                     out[i] = explanations[i]
                 return out
-            print("out = ", out)
 
         else:
             emsg = "Instance must have 1 or 2 dimensions!"
@@ -241,16 +238,15 @@ class KernelExplainer(Explainer):
     #       変動が1つのみ: その1つに全寄与を割り当てる
     #       複数: Kernel SHAP のサンプリング手法によりShapley値を近似計算
     #   計算には allocate → addsample → run → solve といった一連のメソッドを呼び出して進める。
-        print("KernelExplainer.explain")
-        
+        print("     KernelExplainer.explain")
+
         # インスタンスを SHAP の標準化されたオブジェクトに変換
         instance = convert_to_instance(incoming_instance)
         # 入力インスタンスと背景データの整合性をチェック
         match_instance_to_data(instance, self.data)
-        print("instance = ", instance)
 
         # 現在のサンプル x と、背景データの値が異なる（実際に変動し得る）特徴量を特定
-        self.varyingInds = self.varying_groups(instance.x) 
+        self.varyingInds = self.varying_groups(instance.x)
         if self.data.groups is None:
             # グループ指定がなければ、そのままインデックスを配列として保持
             self.varyingFeatureGroups = np.array([i for i in self.varyingInds])
@@ -281,7 +277,6 @@ class KernelExplainer(Explainer):
         elif safe_isinstance(model_out, "tensorflow.python.framework.ops.SymbolicTensor"):
             model_out = self._convert_symbolic_tensor(model_out)
         self.fx = model_out[0]  # 現在のサンプルにおけるモデル出力 (マルチ出力なら先頭要素のみ)
-        print("self.fx = ", self.fx)
 
         # 出力がベクトル（マルチ出力）かどうかを確認
         if not self.vector_out:
@@ -431,7 +426,6 @@ class KernelExplainer(Explainer):
                 weight_left = np.sum(weight_vector[num_full_subsets:])
                 log.info(f"{weight_left = }")
                 self.kernelWeights[nfixed_samples:] *= weight_left / self.kernelWeights[nfixed_samples:].sum()
-                print("self.kernelWeights = ", self.kernelWeights)
 
             # これまでに生成したサンプルをモデルに入力して予測値を得る
             self.run()
@@ -450,9 +444,8 @@ class KernelExplainer(Explainer):
             phi_var = np.squeeze(phi_var, axis=1)
 
         # SHAP 値( phi )を返す
-        print("phi = ", phi)
         return phi
-    
+
     @staticmethod
     def not_equal(i, j):
     #   2つの要素が「実質的に等しいかどうか」を判定するヘルパー関数。
@@ -579,7 +572,7 @@ class KernelExplainer(Explainer):
     def run(self):
     #   これまでに追加された合成サンプルを実際にモデルに入力し、モデルの出力を得る。
     #   モデル出力を self.y に格納し、さらに各サンプルの期待値(バックグラウンド重み付き平均)を計算して self.ey に保存する。
-        print("KernelExplainer.run")
+        print("     KernelExplainer.run")
         num_to_run = self.nsamplesAdded * self.N - self.nsamplesRun * self.N
         data = self.synth_data[self.nsamplesRun * self.N : self.nsamplesAdded * self.N, :]
         if self.keep_index:
@@ -605,9 +598,6 @@ class KernelExplainer(Explainer):
 
             self.ey[i, :] = eyVal
             self.nsamplesRun += 1
-        
-        #print("self.y = ", self.y)
-        #print("self.ey = ", self.ey)
 
     def solve(self, fraction_evaluated, dim):
     #   サンプリングした合成サンプルの結果(y, eyなど)を用いて、重み付き線形回帰を解き、各特徴量(グループ)のShapley値を推定するメソッド。
