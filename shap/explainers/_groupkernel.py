@@ -36,12 +36,12 @@ from ._explainer import Explainer
 log = logging.getLogger("shap")
 
 
-class KernelExplainer(Explainer):
+class GroupkernelExplainer(Explainer):
     def __init__(self, model, data, feature_names=None, link="identity", **kwargs):
     #   ユーザが与えた model や data をSHAP用の標準形式に変換し、背景データやリンク関数、モデルの期待値(ベースライン)などを初期化する。
     #   また、背景データが多い場合には警告を出す。
     # data = background data
-        print("KernelExplainer.__init__")
+        print("GroupkernelExplainer.__init__")
         if feature_names is not None:
             self.data_feature_names = feature_names
         elif isinstance(data, pd.DataFrame):
@@ -473,8 +473,15 @@ class KernelExplainer(Explainer):
     #   x:1行分のデータ
     def varying_groups(self, x):
     #   入力サンプル x と背景データを比較し、「背景データと異なる値を取る特徴量(グループ)」のインデックスを見つける。
-    #   異なる値を取る特徴量でないとSHAP値計算ができないため。
-    #   定義: 疎行列型 (scipy.sparse.spmatrix のサブクラス) のオブジェクトであれば issparse は True を返す。
+    #   背景データが sparse な場合、特徴量が 0 である場合は「変動なし」として 0 を返す。
+    #   疎行列・密行列の両方に対応し、不一致があるかどうかで変動する特徴量を特定する。
+    #
+    # 大きく分けて以下の手順で処理を行う:
+    # 1) 密行列の場合:
+    #    - グループごとに値を比較し、異なるものが見つかった際にそのグループを変動ありとする。
+    # 2) 疎行列の場合:
+    #    - 非ゼロの列のみに注目し、背景データと入力サンプルが完全に一致しない列を抽出する。
+    #    - 一部だけ異なる列がある場合や、背景データの一部がゼロで入力サンプルが非ゼロの場合も考慮する。
 
         if not scipy.sparse.issparse(x):
             varying = np.zeros(self.data.groups_size) #varying = [0. 0. ...]
