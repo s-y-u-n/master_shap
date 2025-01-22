@@ -488,7 +488,6 @@ class GroupkernelExplainer(Explainer):
             for i in range(self.data.groups_size): #i番目の特徴量に対して実行
                 inds = self.data.groups[i] #グループ指定を取り出し
                 x_group = x[0, inds] #xは[[x1,x2,...]]の形式なので、x[0, inds]でグループ指定の特徴量を取り出す
-                print("     KernelExplainer.varying_groups: x_group = ", x_group)
                 if scipy.sparse.issparse(x_group):
                     if all(j not in x.nonzero()[1] for j in inds):
                         varying[i] = False

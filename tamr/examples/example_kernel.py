@@ -1,6 +1,6 @@
 import sys
-sys.path.insert(0, '/Users/tamurashuntarou/CML/code/master_shap')
-#sys.path.insert(0, '/Users/tamr/CMIS/code/master_shap')
+#sys.path.insert(0, '/Users/tamurashuntarou/CML/code/master_shap')
+sys.path.insert(0, '/Users/tamr/CMIS/code/master_shap')
 import xgboost
 from sklearn.model_selection import train_test_split
 from sklearn.datasets import fetch_california_housing
