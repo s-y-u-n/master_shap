@@ -1,14 +1,14 @@
 import sys
-#sys.path.append('/Users/tamurashuntarou/CML/code/master_shap')
-sys.path.insert(0, '/Users/tamr/CMIS/code/master_shap')
+sys.path.insert(0, '/Users/tamurashuntarou/CML/code/master_shap')
+#sys.path.insert(0, '/Users/tamr/CMIS/code/master_shap')
 import xgboost
 from sklearn.model_selection import train_test_split
 from sklearn.datasets import fetch_california_housing
 import shap
 
-# データセットの読み込み
+# データセットの読み込み（20サンプルのみ）
 california = fetch_california_housing()
-X, y = california.data, california.target
+X, y = california.data[:20], california.target[:20]
 
 # 30サンプルだけ抽出
 X, y = X[:30], y[:30]
